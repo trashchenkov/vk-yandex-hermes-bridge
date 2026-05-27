@@ -1,0 +1,26 @@
+# secrets and local state
+.env
+*.env
+!.env.example
+state/
+*.sqlite3
+*.db
+*.db-*
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node/Yandex function build
+node_modules/
+npm-debug.log*
+*.zip
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

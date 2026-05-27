@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""VM-side worker for VK -> Yandex Message Queue -> local Hermes -> VK.
+
+The worker keeps Hermes private: it polls Yandex Message Queue outbound from the
+VM, calls the Hermes API Server on 127.0.0.1, sends the answer to VK, then
+acknowledges the queue message.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import random
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import boto3
+import requests
+from botocore.config import Config
+
+LOG = logging.getLogger("vk_hermes_worker")
+VK_MAX_MESSAGE_CHARS = 9000
+
+
+def load_dotenv(path: str | Path) -> None:
+    p = Path(path)
+    if not p.exists():
+        return
+    for line in p.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"\'')
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def env(name: str, fallback: str = "") -> str:
+    return os.environ.get(name) or fallback
+
+
+def int_env(name: str, fallback: int) -> int:
+    try:
+        return int(env(name, str(fallback)))
+    except ValueError:
+        return fallback
+
+
+def normalize_vk_message(payload: dict[str, Any]) -> dict[str, Any]:
+    obj = payload.get("object") or {}
+    message = obj.get("message") or obj
+    peer_id = str(message.get("peer_id") or message.get("user_id") or message.get("from_id") or "")
+    from_id = str(message.get("from_id") or message.get("user_id") or peer_id or "")
+    text = str(message.get("text") or message.get("body") or "").strip()
+    message_id = str(message.get("id") or message.get("conversation_message_id") or payload.get("event_id") or "")
+    attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+    return {
+        "message": message,
+        "peer_id": peer_id,
+        "from_id": from_id,
+        "text": text,
+        "message_id": message_id,
+        "attachments": attachments,
+    }
+
+
+def truthy_env(name: str) -> bool:
+    return env(name).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def allowed_vk_users() -> set[str]:
+    raw = env("VK_ALLOWED_USERS")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def is_authorized(vk: dict[str, Any]) -> bool:
+    """Return True when the VK sender may reach Hermes tools.
+
+    Production deployments should set VK_ALLOWED_USERS. VK_ALLOW_ALL_USERS is
+    useful for first smoke tests only and should not be enabled for public
+    communities.
+    """
+    if truthy_env("VK_ALLOW_ALL_USERS"):
+        return True
+    allowed = allowed_vk_users()
+    if not allowed:
+        return False
+    return str(vk.get("from_id") or "") in allowed
+
+
+def unauthorized_reply_text() -> str:
+    return env("VK_UNAUTHORIZED_REPLY", "Бот приватный. Доступ к Hermes Agent ограничен.").strip()
+
+
+def is_help_command(text: str) -> bool:
+    return text.strip().lower() in {"начать", "/start", "помощь", "/help"}
+
+
+def help_text() -> str:
+    return "\n".join([
+        "Привет! Я VK-канал связи с Hermes Agent.",
+        "",
+        "Напиши обычное сообщение — я передам его агенту и верну ответ сюда.",
+        "Команды: /help, помощь, /start, начать.",
+    ])
+
+
+def build_hermes_input(vk: dict[str, Any]) -> str:
+    attachments = vk["attachments"]
+    attachment_summary = ""
+    if attachments:
+        types = ", ".join([str(a.get("type")) for a in attachments if isinstance(a, dict) and a.get("type")])
+        attachment_summary = f"\n\n[VK attachments: {types}]"
+    return f"{vk['text'] or '[empty VK message]'}{attachment_summary}"
+
+
+def hermes_instructions(vk: dict[str, Any]) -> str:
+    return "\n".join([
+        "Ты отвечаешь пользователю через VK community messages.",
+        "Пиши на русском, кратко и по делу, если пользователь не просит подробно.",
+        "Не используй Telegram MarkdownV2; VK поддерживает обычный текст и ссылки.",
+        f"VK peer_id: {vk['peer_id']}; VK from_id: {vk['from_id']}.",
+    ])
+
+
+def extract_hermes_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    output = data.get("output")
+    if isinstance(output, list):
+        parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for content in item.get("content") or []:
+                if isinstance(content, dict) and content.get("type") in {"output_text", "text"} and content.get("text"):
+                    parts.append(str(content["text"]))
+        if parts:
+            return "\n".join(parts).strip()
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = (choices[0] or {}).get("message") or {}
+        if msg.get("content"):
+            return str(msg["content"]).strip()
+    return ""
+
+
+def call_hermes(vk: dict[str, Any]) -> str:
+    base = env("HERMES_API_BASE", "http://127.0.0.1:8642").rstrip("/")
+    key = env("HERMES_API_KEY") or env("API_SERVER_KEY")
+    if not key:
+        raise RuntimeError("HERMES_API_KEY or API_SERVER_KEY is required")
+    payload = {
+        "model": env("HERMES_MODEL", "hermes-agent"),
+        "input": build_hermes_input(vk),
+        "instructions": hermes_instructions(vk),
+        "conversation": f"vk:{vk['peer_id']}",
+        "store": True,
+    }
+    res = requests.post(
+        f"{base}/v1/responses",
+        headers={
+            "authorization": f"Bearer {key}",
+            "content-type": "application/json",
+            "x-hermes-session-key": f"vk:{vk['peer_id']}",
+        },
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout=int_env("HERMES_TIMEOUT_MS", 120000) / 1000,
+    )
+    text = res.text
+    try:
+        data = res.json()
+    except Exception:
+        data = {"raw": text}
+    if not res.ok:
+        raise RuntimeError(f"Hermes API HTTP {res.status_code}: {text[:500]}")
+    answer = extract_hermes_text(data)
+    if not answer:
+        raise RuntimeError("Hermes API returned no assistant text")
+    return answer
+
+
+def split_for_vk(text: str) -> list[str]:
+    prefix = env("VK_REPLY_PREFIX", "")
+    remaining = f"{prefix}{text or ''}".strip() or "Готово."
+    chunks: list[str] = []
+    while len(remaining) > VK_MAX_MESSAGE_CHARS:
+        cut = remaining.rfind("\n\n", 0, VK_MAX_MESSAGE_CHARS)
+        if cut < VK_MAX_MESSAGE_CHARS // 2:
+            cut = remaining.rfind("\n", 0, VK_MAX_MESSAGE_CHARS)
+        if cut < VK_MAX_MESSAGE_CHARS // 2:
+            cut = remaining.rfind(" ", 0, VK_MAX_MESSAGE_CHARS)
+        if cut <= 0:
+            cut = VK_MAX_MESSAGE_CHARS
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def send_vk_message(peer_id: str, message: str) -> None:
+    token = env("VK_GROUP_TOKEN")
+    if not token:
+        raise RuntimeError("VK_GROUP_TOKEN is required")
+    data = {
+        "access_token": token,
+        "v": env("VK_API_VERSION", "5.199"),
+        "peer_id": str(peer_id),
+        "random_id": str(random.randint(1, 2_147_483_647)),
+        "message": message,
+    }
+    res = requests.post("https://api.vk.com/method/messages.send", data=data, timeout=30)
+    payload = res.json()
+    if not res.ok or payload.get("error"):
+        raise RuntimeError(f"VK messages.send failed: HTTP {res.status_code} {str(payload.get('error') or payload)[:500]}")
+
+
+def reply_vk(peer_id: str, text: str) -> None:
+    for chunk in split_for_vk(text):
+        send_vk_message(peer_id, chunk)
+
+
+def event_fingerprint(payload: dict[str, Any]) -> str:
+    vk = normalize_vk_message(payload)
+    raw = "|".join([
+        str(payload.get("event_id") or ""),
+        str(payload.get("group_id") or ""),
+        vk["peer_id"],
+        vk["message_id"],
+        vk["text"],
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class DedupStore:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.path)
+        self.db.execute("CREATE TABLE IF NOT EXISTS processed (key TEXT PRIMARY KEY, created_at REAL NOT NULL)")
+        self.db.commit()
+
+    def seen(self, key: str) -> bool:
+        row = self.db.execute("SELECT 1 FROM processed WHERE key = ?", (key,)).fetchone()
+        return row is not None
+
+    def mark(self, key: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO processed (key, created_at) VALUES (?, ?)", (key, time.time()))
+        self.db.commit()
+
+    def cleanup(self, max_age_days: int = 14) -> None:
+        cutoff = time.time() - max_age_days * 86400
+        self.db.execute("DELETE FROM processed WHERE created_at < ?", (cutoff,))
+        self.db.commit()
+
+
+def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
+    vk = normalize_vk_message(payload)
+    if not vk["peer_id"]:
+        LOG.info("skip payload without peer_id")
+        return
+    if vk["message"].get("out"):
+        LOG.info("skip outgoing VK message")
+        return
+
+    key = event_fingerprint(payload)
+    if dedup.seen(key):
+        LOG.info("skip duplicate event %s", key[:12])
+        return
+
+    if not is_authorized(vk):
+        LOG.warning("unauthorized VK user from_id=%s peer_id=%s", vk["from_id"], vk["peer_id"])
+        reply = unauthorized_reply_text()
+        if reply:
+            reply_vk(vk["peer_id"], reply)
+        dedup.mark(key)
+        return
+
+    if is_help_command(vk["text"]):
+        reply_vk(vk["peer_id"], help_text())
+    else:
+        answer = call_hermes(vk)
+        reply_vk(vk["peer_id"], answer)
+    dedup.mark(key)
+
+
+def sqs_client():
+    return boto3.client(
+        "sqs",
+        endpoint_url=env("QUEUE_ENDPOINT", "https://message-queue.api.cloud.yandex.net"),
+        region_name=env("AWS_REGION", "ru-central1"),
+        config=Config(retries={"max_attempts": 5, "mode": "standard"}),
+    )
+
+
+def run_once(client: Any, queue_url: str, dedup: DedupStore) -> int:
+    res = client.receive_message(
+        QueueUrl=queue_url,
+        MaxNumberOfMessages=int_env("QUEUE_MAX_MESSAGES", 1),
+        WaitTimeSeconds=int_env("QUEUE_WAIT_TIME_SECONDS", 20),
+        VisibilityTimeout=int_env("QUEUE_VISIBILITY_TIMEOUT", 300),
+    )
+    messages = res.get("Messages") or []
+    for msg in messages:
+        receipt = msg["ReceiptHandle"]
+        body = json.loads(msg.get("Body") or "{}")
+        payload = body.get("payload") if isinstance(body, dict) and "payload" in body else body
+        if not isinstance(payload, dict):
+            LOG.warning("invalid queue message body: %r", body)
+            client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+            continue
+        try:
+            process_payload(payload, dedup)
+        except Exception:
+            LOG.exception("processing failed; leaving message for retry")
+            continue
+        client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+    return len(messages)
+
+
+def main() -> int:
+    default_env = str(Path(__file__).resolve().parents[1] / ".env")
+    default_dedup = str(Path(__file__).resolve().parents[1] / "state" / "vk-worker-dedup.sqlite3")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env", default=default_env, help="bridge .env path")
+    parser.add_argument("--hermes-env", default="/root/.hermes/.env", help="Hermes .env path for API_SERVER_KEY fallback")
+    parser.add_argument("--once", action="store_true", help="process one poll cycle and exit")
+    args = parser.parse_args()
+
+    load_dotenv(args.hermes_env)
+    load_dotenv(args.env)
+
+    logging.basicConfig(
+        level=getattr(logging, env("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    queue_url = env("QUEUE_URL")
+    if not queue_url:
+        raise SystemExit("QUEUE_URL is required")
+
+    dedup = DedupStore(env("DEDUP_DB", default_dedup))
+    dedup.cleanup()
+    client = sqs_client()
+
+    while True:
+        run_once(client, queue_url, dedup)
+        if args.once:
+            return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
