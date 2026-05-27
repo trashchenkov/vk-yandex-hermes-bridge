@@ -50,23 +50,35 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-2. Create Yandex Message Queue and static keys:
+2. Prepare Yandex Cloud resources:
 
-- Cloud Function key needs write permission to the queue.
-- VM worker key needs receive/delete permission.
+- Create a Yandex Message Queue: https://yandex.cloud/ru/docs/message-queue/quickstart/
+- Create service accounts for the Cloud Function and VM worker: https://yandex.cloud/ru/docs/iam/operations/sa/create/
+- Create static access keys for those service accounts: https://yandex.cloud/ru/docs/iam/operations/authentication/manage-access-keys/
+- Grant the Cloud Function key write permission to the queue.
+- Grant the VM worker key receive/delete permission.
+- Role reference: https://yandex.cloud/ru/docs/iam/concepts/access-control/roles/
 
 3. Configure VK community Callback API:
 
-- enable community messages and bot capabilities;
+- enable community messages and bot capabilities: https://dev.vk.com/ru/api/bots/getting-started
 - enable `message_new` events;
 - set callback secret;
-- configure the public Yandex Function URL.
+- configure the public Yandex Function URL;
+- Callback API guide: https://dev.vk.com/ru/api/callback/getting-started
+- VK `messages.send` reference: https://dev.vk.com/ru/method/messages.send
 
 4. Build Cloud Function artifact:
 
 ```bash
 ./scripts/build-yandex-function-zip.sh
 ```
+
+5. Create or update the Yandex Cloud Function:
+
+- Cloud Functions overview: https://yandex.cloud/ru/docs/functions/
+- Create a function: https://yandex.cloud/ru/docs/functions/quickstart/create-function/
+- Function concepts and runtime settings: https://yandex.cloud/ru/docs/functions/concepts/function/
 
 Deploy `/tmp/vk-hermes-function.zip` to Yandex Cloud Functions with handler `index.handler` and env vars from `.env` relevant to the function:
 
@@ -82,7 +94,7 @@ VK_CONFIRMATION_TOKEN=...
 VK_SECRET=...
 ```
 
-5. Prepare Hermes API Server on the VM:
+6. Prepare Hermes API Server on the VM:
 
 ```bash
 API_SERVER_HOST=127.0.0.1 API_SERVER_PORT=8642 ./scripts/setup-hermes-api-server.sh
@@ -95,7 +107,7 @@ Smoke test:
 curl -sS -H "Authorization: Bearer YOUR_API_SERVER_KEY" http://127.0.0.1:8642/v1/models
 ```
 
-6. Install and start worker:
+7. Install and start worker:
 
 ```bash
 ./scripts/install-vk-hermes-worker-service.sh
