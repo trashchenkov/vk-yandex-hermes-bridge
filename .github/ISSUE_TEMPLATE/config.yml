@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Hermes Agent documentation
+    url: https://hermes-agent.nousresearch.com/docs
+    about: Hermes Agent setup, gateway, API Server, tools, and profiles.
+  - name: Yandex Cloud Functions documentation
+    url: https://yandex.cloud/ru/docs/functions/
+    about: Yandex Cloud Function setup and runtime configuration.
+  - name: Yandex Message Queue documentation
+    url: https://yandex.cloud/ru/docs/message-queue/
+    about: Queue setup, permissions, and SQS-compatible API.
+  - name: VK Callback API documentation
+    url: https://dev.vk.com/ru/api/callback/getting-started
+    about: VK community callback events and confirmation flow.

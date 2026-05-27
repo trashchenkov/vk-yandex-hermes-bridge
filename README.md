@@ -142,6 +142,10 @@ bash -n scripts/install-vk-hermes-worker-service.sh
 bash -n scripts/build-yandex-function-zip.sh
 ```
 
+## Roadmap
+
+See `ROADMAP.md` for planned hardening and product features: doctor/security checks, CI, replay tooling, shadow mode, VK Long Poll mode, policy engine, public FAQ/RAG mode, owner approvals, and native Hermes platform-plugin direction.
+
 ## Operational notes
 
 - Queue messages are deleted only after successful processing and VK reply.
