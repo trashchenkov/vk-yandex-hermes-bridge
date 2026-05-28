@@ -770,6 +770,7 @@ def run_smoke(
                 and result["hermes_called"] is expected_hermes_called
             )
             detail = f"decision={result['policy_decision']} outbound={len(result['outbound_messages'])} hermes_called={result['hermes_called']}"
+            final_outbound = result["outbound_messages"][-1] if result["outbound_messages"] else None
             checks.append(smoke_check(
                 name,
                 ok,
@@ -777,6 +778,7 @@ def run_smoke(
                 trace_id=result["trace_id"],
                 outbound_count=len(result["outbound_messages"]),
                 hermes_called=result["hermes_called"],
+                final_outbound_payload=final_outbound,
             ))
         except Exception as exc:
             checks.append(smoke_check(name, False, str(exc)))
@@ -789,6 +791,9 @@ def format_smoke_report(report: dict[str, Any]) -> str:
         line = f"[{check.get('status')}] {check.get('name')}: {check.get('detail')}"
         if check.get("trace_id"):
             line = f"{line} trace={check.get('trace_id')}"
+        if check.get("final_outbound_payload"):
+            outbound_json = json.dumps(check["final_outbound_payload"], ensure_ascii=False, separators=(",", ":"))
+            line = f"{line} final_outbound={outbound_json}"
         lines.append(line)
     return "\n".join(lines)
 

@@ -35,6 +35,11 @@ def test_run_smoke_executes_owner_and_public_fake_e2e(monkeypatch, tmp_path):
     assert by_name["public_fake_e2e"]["status"] == "ok"
     assert by_name["owner_fake_e2e"]["trace_id"].startswith("vk-")
     assert by_name["owner_fake_e2e"]["outbound_count"] == 1
+    assert by_name["owner_fake_e2e"]["final_outbound_payload"] == {
+        "peer_id": "254662087",
+        "message": "smoke fake answer",
+        "random_id": worker.stable_random_id(by_name["owner_fake_e2e"]["trace_id"], 0),
+    }
     assert by_name["public_fake_e2e"]["hermes_called"] is False
 
 
@@ -43,13 +48,14 @@ def test_format_smoke_report_is_human_readable():
     text = worker.format_smoke_report({
         "ok": False,
         "checks": [
-            {"name": "owner_fake_e2e", "status": "ok", "detail": "reply path works", "trace_id": "vk-1"},
+            {"name": "owner_fake_e2e", "status": "ok", "detail": "reply path works", "trace_id": "vk-1", "final_outbound_payload": {"peer_id": "1", "message": "ok", "random_id": 7}},
             {"name": "public_fake_e2e", "status": "fail", "detail": "unexpected Hermes call"},
         ],
     })
 
     assert "Smoke: FAIL" in text
     assert "[ok] owner_fake_e2e: reply path works trace=vk-1" in text
+    assert 'final_outbound={"peer_id":"1","message":"ok","random_id":7}' in text
     assert "[fail] public_fake_e2e: unexpected Hermes call" in text
 
 
