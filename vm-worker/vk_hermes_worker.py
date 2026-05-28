@@ -76,24 +76,63 @@ def truthy_env(name: str) -> bool:
     return env(name).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def allowed_vk_users() -> set[str]:
-    raw = env("VK_ALLOWED_USERS")
+def env_id_set(name: str) -> set[str]:
+    raw = env(name)
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
-def is_authorized(vk: dict[str, Any]) -> bool:
-    """Return True when the VK sender may reach Hermes tools.
+def allowed_vk_users() -> set[str]:
+    return env_id_set("VK_ALLOWED_USERS")
 
-    Production deployments should set VK_ALLOWED_USERS. VK_ALLOW_ALL_USERS is
-    useful for first smoke tests only and should not be enabled for public
-    communities.
-    """
-    if truthy_env("VK_ALLOW_ALL_USERS"):
-        return True
-    allowed = allowed_vk_users()
-    if not allowed:
-        return False
-    return str(vk.get("from_id") or "") in allowed
+
+def owner_vk_users() -> set[str]:
+    # VK_ALLOWED_USERS is the legacy owner allowlist; once VK_OWNER_ID is set, it is authoritative.
+    explicit = env_id_set("VK_OWNER_ID")
+    return explicit or allowed_vk_users()
+
+
+def trusted_vk_users() -> set[str]:
+    return env_id_set("VK_TRUSTED_USERS")
+
+
+def blocked_vk_users() -> set[str]:
+    return env_id_set("VK_BLOCKED_USERS")
+
+
+def resolve_role(vk: dict[str, Any]) -> str:
+    sender = str(vk.get("from_id") or "")
+    if sender in blocked_vk_users():
+        return "blocked"
+    if sender in owner_vk_users():
+        return "owner"
+    if sender in trusted_vk_users() or truthy_env("VK_ALLOW_ALL_USERS"):
+        return "trusted"
+    return "public"
+
+
+def is_owner_command(text: str) -> bool:
+    return text.strip().startswith("!")
+
+
+def decide_policy(vk: dict[str, Any]) -> dict[str, Any]:
+    role = resolve_role(vk)
+    text = str(vk.get("text") or "")
+    if role == "blocked":
+        return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "blocked_user"}
+    if is_owner_command(text):
+        if role == "owner":
+            return {"role": role, "action": "owner_command", "hermes_allowed": False, "reason": "owner_command"}
+        return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "owner_command_requires_owner"}
+    if role in {"owner", "trusted"}:
+        return {"role": role, "action": "reply", "hermes_allowed": True, "reason": "allowed_user"}
+    if truthy_env("VK_PUBLIC_HANDOFF"):
+        return {"role": role, "action": "handoff", "hermes_allowed": False, "reason": "public_handoff"}
+    return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "public_default_deny"}
+
+
+def is_authorized(vk: dict[str, Any]) -> bool:
+    """Return True when the VK sender may reach Hermes tools."""
+    return bool(decide_policy(vk).get("hermes_allowed"))
 
 
 def unauthorized_reply_text() -> str:
@@ -297,9 +336,7 @@ class DedupStore:
 
 
 def role_for_vk(vk: dict[str, Any]) -> str:
-    if is_authorized(vk):
-        return "owner"
-    return "public"
+    return resolve_role(vk)
 
 
 def trace_id_for_payload(payload: dict[str, Any]) -> str:
@@ -363,22 +400,33 @@ def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
         LOG.info("skip duplicate event %s trace_id=%s", key[:12], trace_id)
         return
 
-    role = role_for_vk(vk)
-    if role != "owner":
-        LOG.warning(
-            "policy decision trace_id=%s role=%s decision=deny from_id=%s peer_id=%s",
-            trace_id,
-            role,
-            vk["from_id"],
-            vk["peer_id"],
-        )
+    decision = decide_policy(vk)
+    role = str(decision["role"])
+    action = str(decision["action"])
+    log_level = logging.WARNING if action in {"deny", "handoff"} else logging.INFO
+    LOG.log(
+        log_level,
+        "policy decision trace_id=%s role=%s decision=%s reason=%s from_id=%s peer_id=%s",
+        trace_id,
+        role,
+        action,
+        decision.get("reason", ""),
+        vk["from_id"],
+        vk["peer_id"],
+    )
+
+    if action in {"deny", "handoff"}:
         reply = unauthorized_reply_text()
         if reply:
             reply_vk(vk["peer_id"], reply, trace_id=trace_id)
         dedup.mark(key)
         return
 
-    LOG.info("policy decision trace_id=%s role=%s decision=reply", trace_id, role)
+    if action == "owner_command":
+        reply_vk(vk["peer_id"], "Owner command accepted, but this command is not implemented yet.", trace_id=trace_id)
+        dedup.mark(key)
+        return
+
     if is_help_command(vk["text"]):
         reply_vk(vk["peer_id"], help_text(), trace_id=trace_id)
     else:
@@ -418,22 +466,20 @@ def run_fake_event(
         globals()["call_hermes"] = original_call_hermes
         globals()["reply_vk"] = original_reply_vk
 
-    role = role_for_vk(vk)
     if not vk["peer_id"]:
-        decision = "skip"
+        policy = {"role": role_for_vk(vk), "action": "skip", "hermes_allowed": False, "reason": "missing_peer_id"}
     elif vk["message"].get("out"):
-        decision = "skip"
-    elif role == "owner":
-        decision = "reply"
+        policy = {"role": role_for_vk(vk), "action": "skip", "hermes_allowed": False, "reason": "outgoing_message"}
     else:
-        decision = "deny"
+        policy = decide_policy(vk)
 
     envelope = build_event_envelope(payload)
     return {
         "trace_id": envelope["trace_id"],
         "envelope": envelope,
-        "role": role,
-        "policy_decision": decision,
+        "role": policy["role"],
+        "policy_decision": policy["action"],
+        "policy": policy,
         "hermes_called": hermes_called,
         "outbound_messages": outbound,
     }
