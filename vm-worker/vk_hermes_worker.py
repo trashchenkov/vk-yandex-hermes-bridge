@@ -84,6 +84,14 @@ def int_env(name: str, fallback: int) -> int:
         return fallback
 
 
+def public_rate_limit_count() -> int:
+    return max(0, int_env("VK_PUBLIC_RATE_LIMIT_COUNT", 60))
+
+
+def public_rate_limit_window_seconds() -> int:
+    return max(1, int_env("VK_PUBLIC_RATE_LIMIT_WINDOW_SECONDS", 3600))
+
+
 def normalize_vk_message(payload: dict[str, Any]) -> dict[str, Any]:
     obj = payload.get("object") or {}
     message = obj.get("message") or obj
@@ -816,6 +824,38 @@ class DedupStore:
         self.db.commit()
 
 
+class RateLimitStore:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if str(path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path))
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS rate_events ("
+            "identity TEXT NOT NULL, created_at REAL NOT NULL)"
+        )
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_rate_events_identity_created ON rate_events(identity, created_at)")
+        self.db.commit()
+
+    def allow(self, identity: str, *, limit: int, window_seconds: int) -> bool:
+        if limit <= 0 or window_seconds <= 0:
+            return True
+        now = time.time()
+        cutoff = now - window_seconds
+        self.db.execute("DELETE FROM rate_events WHERE created_at < ?", (cutoff,))
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM rate_events WHERE identity = ? AND created_at >= ?",
+            (identity, cutoff),
+        ).fetchone()
+        count = int(row[0] if row else 0)
+        if count >= limit:
+            self.db.commit()
+            return False
+        self.db.execute("INSERT INTO rate_events (identity, created_at) VALUES (?, ?)", (identity, now))
+        self.db.commit()
+        return True
+
+
 class TraceStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -1168,6 +1208,7 @@ def process_payload(
     dedup: DedupStore,
     trace_store: TraceStore | None = None,
     review_store: ReviewStore | None = None,
+    rate_store: RateLimitStore | None = None,
 ) -> None:
     vk = normalize_vk_message(payload)
     trace_id = trace_id_for_payload(payload)
@@ -1186,6 +1227,11 @@ def process_payload(
     decision = decide_policy(vk)
     role = str(decision["role"])
     action = str(decision["action"])
+    if rate_store and role in {"public", "group_chat"}:
+        identity = f"{role}:{vk['from_id'] or vk['peer_id']}"
+        if not rate_store.allow(identity, limit=public_rate_limit_count(), window_seconds=public_rate_limit_window_seconds()):
+            decision = {"role": role, "action": "deny", "hermes_allowed": False, "reason": "public_rate_limited"}
+            action = "deny"
     envelope = build_event_envelope(payload)
     trace_record = new_trace_record(envelope, decision)
     log_level = logging.WARNING if action in {"deny", "handoff"} else logging.INFO
@@ -1537,6 +1583,7 @@ def run_doctor(
     trace_db: str | Path,
     review_db: str | Path,
     poison_db: str | Path | None = None,
+    rate_db: str | Path | None = None,
     check_network: bool = False,
 ) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
@@ -1617,8 +1664,14 @@ def run_doctor(
         ReviewStore(review_db)
         if poison_db is not None:
             PoisonStore(poison_db)
-        state_detail = "dedup/trace/review/poison stores opened" if poison_db is not None else "dedup/trace/review stores opened"
-        checks.append(doctor_check("STATE_DBS", True, state_detail))
+        if rate_db is not None:
+            RateLimitStore(rate_db)
+        stores = ["dedup", "trace", "review"]
+        if poison_db is not None:
+            stores.append("poison")
+        if rate_db is not None:
+            stores.append("rate")
+        checks.append(doctor_check("STATE_DBS", True, "/".join(stores) + " stores opened"))
     except Exception as exc:
         checks.append(doctor_check("STATE_DBS", False, str(exc), "Ensure state directory exists and is writable by the worker user."))
     return {"ok": all(check["status"] == "ok" for check in checks), "checks": checks}
@@ -1648,6 +1701,7 @@ def run_health(
     trace_db: str | Path,
     review_db: str | Path,
     poison_db: str | Path | None = None,
+    rate_db: str | Path | None = None,
     check_network: bool = False,
 ) -> dict[str, Any]:
     components: list[dict[str, Any]] = []
@@ -1692,8 +1746,14 @@ def run_health(
         ReviewStore(review_db)
         if poison_db is not None:
             PoisonStore(poison_db)
-        state_detail = "dedup/trace/review/poison stores opened" if poison_db is not None else "dedup/trace/review stores opened"
-        components.append(health_component("state_dbs", "ok", state_detail))
+        if rate_db is not None:
+            RateLimitStore(rate_db)
+        stores = ["dedup", "trace", "review"]
+        if poison_db is not None:
+            stores.append("poison")
+        if rate_db is not None:
+            stores.append("rate")
+        components.append(health_component("state_dbs", "ok", "/".join(stores) + " stores opened"))
     except Exception as exc:
         components.append(health_component("state_dbs", "fail", str(exc)))
 
@@ -1770,6 +1830,7 @@ def run_long_poll_once(
     state: dict[str, Any] | None = None,
     trace_store: TraceStore | None = None,
     review_store: ReviewStore | None = None,
+    rate_store: RateLimitStore | None = None,
 ) -> dict[str, Any]:
     current = dict(state or {})
     if not current.get("key") or not current.get("server") or not current.get("ts"):
@@ -1797,7 +1858,10 @@ def run_long_poll_once(
         payload = vk_long_poll_update_payload(update)
         if not payload:
             continue
-        process_payload(payload, dedup, trace_store=trace_store, review_store=review_store)
+        if rate_store:
+            process_payload(payload, dedup, trace_store=trace_store, review_store=review_store, rate_store=rate_store)
+        else:
+            process_payload(payload, dedup, trace_store=trace_store, review_store=review_store)
         processed += 1
     current["processed"] = processed
     current["refresh"] = False
@@ -1809,17 +1873,19 @@ def run_long_poll_loop(
     dedup_path: str | Path,
     trace_path: str | Path,
     review_path: str | Path,
+    rate_path: str | Path,
     once: bool = False,
     session: Any | None = None,
 ) -> int:
     dedup = DedupStore(dedup_path)
     trace_store = TraceStore(trace_path)
     review_store = ReviewStore(review_path)
+    rate_store = RateLimitStore(rate_path)
     session = session or requests.Session()
     state: dict[str, Any] | None = None
     cycles = 0
     while True:
-        state = run_long_poll_once(session, dedup, state=state, trace_store=trace_store, review_store=review_store)
+        state = run_long_poll_once(session, dedup, state=state, trace_store=trace_store, review_store=review_store, rate_store=rate_store)
         cycles += 1
         LOG.info("long poll cycle processed=%s ts=%s refresh=%s", state.get("processed"), state.get("ts"), state.get("refresh"))
         if once:
@@ -1862,6 +1928,7 @@ def run_once(
     trace_store: TraceStore | None = None,
     review_store: ReviewStore | None = None,
     poison_store: PoisonStore | None = None,
+    rate_store: RateLimitStore | None = None,
 ) -> int:
     res = client.receive_message(
         QueueUrl=queue_url,
@@ -1880,7 +1947,10 @@ def run_once(
             client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
             continue
         try:
-            process_payload(payload, dedup, trace_store=trace_store, review_store=review_store)
+            if rate_store:
+                process_payload(payload, dedup, trace_store=trace_store, review_store=review_store, rate_store=rate_store)
+            else:
+                process_payload(payload, dedup, trace_store=trace_store, review_store=review_store)
         except Exception as exc:
             receive_count = _message_receive_count(msg)
             if poison_store and receive_count >= _poison_threshold():
@@ -1901,6 +1971,7 @@ def main() -> int:
     default_trace = str(default_state / "vk-worker-trace.sqlite3")
     default_review = str(default_state / "vk-worker-review.sqlite3")
     default_poison = str(default_state / "vk-worker-poison.sqlite3")
+    default_rate = str(default_state / "vk-worker-rate-limit.sqlite3")
     default_fixture_dir = str(Path(__file__).resolve().parents[1] / "fixtures" / "vk")
 
     parser = argparse.ArgumentParser()
@@ -1912,6 +1983,7 @@ def main() -> int:
     parser.add_argument("--trace-db", help="SQLite trace store path")
     parser.add_argument("--review-db", help="SQLite review inbox path")
     parser.add_argument("--poison-db", help="SQLite poison-message/dead-letter path")
+    parser.add_argument("--rate-db", help="SQLite public rate-limit path")
     parser.add_argument("--fake-event", help="process a saved VK event fixture without VK/Yandex/Hermes secrets")
     parser.add_argument("--replay", nargs="+", help="replay one or more saved VK event fixtures with fake Hermes/VK sends")
     parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event/--replay")
@@ -1953,6 +2025,7 @@ def main() -> int:
             trace_db=args.trace_db or env("TRACE_DB", default_trace),
             review_db=args.review_db or env("REVIEW_DB", default_review),
             poison_db=args.poison_db or env("POISON_DB", default_poison),
+            rate_db=args.rate_db or env("RATE_LIMIT_DB", default_rate),
             check_network=args.doctor_network,
         )
         print(format_doctor_report(report))
@@ -1965,6 +2038,7 @@ def main() -> int:
             trace_db=args.trace_db or env("TRACE_DB", default_trace),
             review_db=args.review_db or env("REVIEW_DB", default_review),
             poison_db=args.poison_db or env("POISON_DB", default_poison),
+            rate_db=args.rate_db or env("RATE_LIMIT_DB", default_rate),
             check_network=args.health_network,
         )
         print(format_health_report(report))
@@ -1984,6 +2058,7 @@ def main() -> int:
             dedup_path=args.dedup_db or env("DEDUP_DB", default_dedup),
             trace_path=args.trace_db or env("TRACE_DB", default_trace),
             review_path=args.review_db or env("REVIEW_DB", default_review),
+            rate_path=args.rate_db or env("RATE_LIMIT_DB", default_rate),
             once=args.once,
         ) and 0
 
@@ -1994,11 +2069,12 @@ def main() -> int:
     trace_store = TraceStore(args.trace_db or env("TRACE_DB", default_trace))
     review_store = ReviewStore(args.review_db or env("REVIEW_DB", default_review))
     poison_store = PoisonStore(args.poison_db or env("POISON_DB", default_poison))
+    rate_store = RateLimitStore(args.rate_db or env("RATE_LIMIT_DB", default_rate))
     dedup.cleanup()
     client = sqs_client()
 
     while True:
-        run_once(client, queue_url, dedup, trace_store=trace_store, review_store=review_store, poison_store=poison_store)
+        run_once(client, queue_url, dedup, trace_store=trace_store, review_store=review_store, poison_store=poison_store, rate_store=rate_store)
         if args.once:
             return 0
 

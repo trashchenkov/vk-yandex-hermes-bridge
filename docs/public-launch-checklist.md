@@ -105,7 +105,9 @@ Audit requirements:
 
 Minimum rate limit plan before public exposure:
 
-- queue visibility/retry settings reviewed;
+- `RATE_LIMIT_DB` points to persistent state;
+- `VK_PUBLIC_RATE_LIMIT_COUNT` and `VK_PUBLIC_RATE_LIMIT_WINDOW_SECONDS` are set for public/group-chat traffic;
+- rate-limited public events are denied before adding review items or calling FAQ/public reply paths;
 - abusive public users can be added to `VK_BLOCKED_USERS`;
 - noisy public traffic can be switched from handoff to deny;
 - pending review queue is monitored and does not grow silently;

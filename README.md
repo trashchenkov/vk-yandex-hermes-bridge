@@ -238,7 +238,7 @@ network_mode: host
 
 `Dockerfile.worker` installs only runtime dependencies from `requirements-vm-worker.txt` and copies worker code/fixtures. It does not copy `.env`, does not bake secrets, and does not bake API keys into the image; `.dockerignore` excludes local secrets, state DBs, caches, and git metadata.
 
-State is persisted in the named Docker volume `vk-hermes-state`, so dedup/trace/review/poison SQLite DBs survive container restarts. The default container command is the queue worker; for local/hobby mode you can override it with Long Poll:
+State is persisted in the named Docker volume `vk-hermes-state`, so dedup/trace/review/poison/rate-limit SQLite DBs survive container restarts. The default container command is the queue worker; for local/hobby mode you can override it with Long Poll:
 
 ```bash
 docker compose run --rm vk-hermes-worker python vm-worker/vk_hermes_worker.py --long-poll --once
@@ -273,6 +273,16 @@ Queue poison-message handling is enabled for queue mode when `POISON_DB` is conf
 POISON_DB=./state/vk-worker-poison.sqlite3
 VK_POISON_MAX_RECEIVE_COUNT=5
 ```
+
+Public/group traffic is rate-limited before it can grow the review queue or reach public FAQ/Hermes handling. Owner/trusted private traffic is not rate-limited by this guard:
+
+```text
+RATE_LIMIT_DB=./state/vk-worker-rate-limit.sqlite3
+VK_PUBLIC_RATE_LIMIT_COUNT=60
+VK_PUBLIC_RATE_LIMIT_WINDOW_SECONDS=3600
+```
+
+Set `VK_PUBLIC_RATE_LIMIT_COUNT=0` to disable the public limiter.
 
 ## Local fake mode
 
