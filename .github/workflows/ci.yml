@@ -36,7 +36,7 @@ jobs:
           cache: pip
 
       - name: Install worker dependencies
-        run: python -m pip install -r vm-worker/requirements.txt pytest
+        run: python -m pip install -r vm-worker/requirements.txt pytest PyYAML
 
       - name: Check worker syntax
         run: python -m py_compile vm-worker/vk_hermes_worker.py

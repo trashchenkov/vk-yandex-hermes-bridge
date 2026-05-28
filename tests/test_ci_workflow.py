@@ -14,6 +14,7 @@ def test_ci_workflow_exists_and_runs_required_checks():
         "node --check yandex-vk-hermes-function/index.js",
         "npm ci --prefix yandex-vk-hermes-function",
         "python -m py_compile vm-worker/vk_hermes_worker.py",
+        "PyYAML",
         "python -m pytest -q",
         "bash -n scripts/setup-hermes-api-server.sh",
         "bash -n scripts/install-vk-hermes-worker-service.sh",
