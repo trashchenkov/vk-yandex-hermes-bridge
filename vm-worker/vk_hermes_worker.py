@@ -1116,6 +1116,115 @@ def sqs_client():
     )
 
 
+def vk_api_version() -> str:
+    return env("VK_API_VERSION", "5.199")
+
+
+def vk_long_poll_server(session: Any) -> dict[str, str]:
+    group_id = env("VK_GROUP_ID")
+    token = env("VK_GROUP_TOKEN")
+    if not group_id:
+        raise RuntimeError("VK_GROUP_ID is required for Long Poll mode")
+    if not token:
+        raise RuntimeError("VK_GROUP_TOKEN is required for Long Poll mode")
+    res = session.post(
+        "https://api.vk.com/method/groups.getLongPollServer",
+        data={"group_id": group_id, "access_token": token, "v": vk_api_version()},
+        timeout=int_env("VK_API_TIMEOUT_SECONDS", 10),
+    )
+    if hasattr(res, "raise_for_status"):
+        res.raise_for_status()
+    data = res.json()
+    if data.get("error"):
+        raise RuntimeError(f"VK Long Poll server error: {data['error']}")
+    server = data.get("response") or {}
+    missing = [name for name in ("key", "server", "ts") if not server.get(name)]
+    if missing:
+        raise RuntimeError(f"VK Long Poll server response missing: {', '.join(missing)}")
+    return {"key": str(server["key"]), "server": str(server["server"]), "ts": str(server["ts"])}
+
+
+def vk_long_poll_update_payload(update: dict[str, Any]) -> dict[str, Any] | None:
+    if update.get("type") != "message_new":
+        return None
+    obj = update.get("object") or {}
+    message = obj.get("message") or obj
+    message_id = message.get("id") or message.get("conversation_message_id") or "unknown"
+    try:
+        group_id: int | str = int(env("VK_GROUP_ID"))
+    except ValueError:
+        group_id = env("VK_GROUP_ID")
+    return {
+        "type": "message_new",
+        "group_id": group_id,
+        "event_id": f"lp-{message_id}",
+        "object": obj,
+    }
+
+
+def run_long_poll_once(
+    session: Any,
+    dedup: DedupStore,
+    *,
+    state: dict[str, Any] | None = None,
+    trace_store: TraceStore | None = None,
+    review_store: ReviewStore | None = None,
+) -> dict[str, Any]:
+    current = dict(state or {})
+    if not current.get("key") or not current.get("server") or not current.get("ts"):
+        current.update(vk_long_poll_server(session))
+    wait = int_env("VK_LONG_POLL_WAIT_SECONDS", 25)
+    res = session.get(
+        current["server"],
+        params={"act": "a_check", "key": current["key"], "ts": current["ts"], "wait": wait},
+        timeout=wait + int_env("VK_API_TIMEOUT_SECONDS", 10),
+    )
+    if hasattr(res, "raise_for_status"):
+        res.raise_for_status()
+    data = res.json()
+    if data.get("failed"):
+        current.update(vk_long_poll_server(session))
+        current["processed"] = 0
+        current["refresh"] = True
+        return current
+    if data.get("ts"):
+        current["ts"] = str(data["ts"])
+    processed = 0
+    for update in data.get("updates") or []:
+        if not isinstance(update, dict):
+            continue
+        payload = vk_long_poll_update_payload(update)
+        if not payload:
+            continue
+        process_payload(payload, dedup, trace_store=trace_store, review_store=review_store)
+        processed += 1
+    current["processed"] = processed
+    current["refresh"] = False
+    return current
+
+
+def run_long_poll_loop(
+    *,
+    dedup_path: str | Path,
+    trace_path: str | Path,
+    review_path: str | Path,
+    once: bool = False,
+    session: Any | None = None,
+) -> int:
+    dedup = DedupStore(dedup_path)
+    trace_store = TraceStore(trace_path)
+    review_store = ReviewStore(review_path)
+    session = session or requests.Session()
+    state: dict[str, Any] | None = None
+    cycles = 0
+    while True:
+        state = run_long_poll_once(session, dedup, state=state, trace_store=trace_store, review_store=review_store)
+        cycles += 1
+        LOG.info("long poll cycle processed=%s ts=%s refresh=%s", state.get("processed"), state.get("ts"), state.get("refresh"))
+        if once:
+            return cycles
+
+
 def run_once(
     client: Any,
     queue_url: str,
@@ -1159,6 +1268,7 @@ def main() -> int:
     parser.add_argument("--env", default=default_env, help="bridge .env path")
     parser.add_argument("--hermes-env", default="/root/.hermes/.env", help="Hermes .env path for API_SERVER_KEY fallback")
     parser.add_argument("--once", action="store_true", help="process one poll cycle and exit")
+    parser.add_argument("--long-poll", action="store_true", help="use VK Long Poll directly instead of Yandex Message Queue")
     parser.add_argument("--dedup-db", help="SQLite dedup store path")
     parser.add_argument("--trace-db", help="SQLite trace store path")
     parser.add_argument("--review-db", help="SQLite review inbox path")
@@ -1216,6 +1326,14 @@ def main() -> int:
         )
         print(format_smoke_report(report))
         return 0 if report["ok"] else 2
+
+    if args.long_poll:
+        return run_long_poll_loop(
+            dedup_path=args.dedup_db or env("DEDUP_DB", default_dedup),
+            trace_path=args.trace_db or env("TRACE_DB", default_trace),
+            review_path=args.review_db or env("REVIEW_DB", default_review),
+            once=args.once,
+        ) and 0
 
     queue_url = env("QUEUE_URL")
     if not queue_url:

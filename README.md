@@ -156,6 +156,28 @@ VK_ALLOWED_USERS=254662087 python3 vm-worker/vk_hermes_worker.py \
 
 The command prints JSON with `trace_id`, `role`, `policy_decision`, whether Hermes would be called, and the fake outbound VK messages.
 
+## VK Long Poll mode
+
+For a simpler local/hobby deployment you can skip Yandex Cloud Function and Message Queue and let the VM worker poll VK directly:
+
+```bash
+python3 vm-worker/vk_hermes_worker.py --long-poll
+```
+
+For a single debug cycle:
+
+```bash
+python3 vm-worker/vk_hermes_worker.py --long-poll --once
+```
+
+Required settings are still `VK_GROUP_ID`, `VK_GROUP_TOKEN`, owner/trusted allowlist, and local `HERMES_API_BASE`/key. Hermes can remain bound to `127.0.0.1`; no public Hermes endpoint is needed.
+
+Trade-offs versus Callback API + Queue:
+
+- Long Poll is easier to run locally and needs no public callback URL or Yandex resources.
+- Callback API + Queue is better for production durability: VK gets a quick `ok`, queue retries survive worker restarts, and long LLM/tool calls do not hold the VK polling connection.
+- Both modes use the same `process_payload` pipeline, dedup store, trace store, review inbox, and access policy checks.
+
 For a one-command fake E2E smoke check that needs no real VK, Yandex, or Hermes secrets:
 
 ```bash
