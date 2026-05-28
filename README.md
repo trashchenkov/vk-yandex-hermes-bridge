@@ -406,4 +406,4 @@ See `ROADMAP.md` for the broader roadmap: doctor/security checks, CI, replay too
 - Responses are chunked below VK's 9000 character message limit.
 - Attachments: owner/trusted inbound photo/doc attachments are rendered as safe, redacted media references for Hermes; outbound `MEDIA:/path` reply lines are uploaded to VK when size/extension checks pass.
 
-See `docs/vk-yandex-hermes-bridge.md` for the detailed deployment reference.
+See `docs/vk-yandex-hermes-bridge.md` for the detailed deployment reference and `docs/release-deploy-checklist.md` for the short MVP release/deploy checklist.
