@@ -118,6 +118,23 @@ The worker sends public requests with a separate `x-hermes-profile` and `x-herme
 
 Recommended public profile setup: create a dedicated Hermes profile (for example `hermes profile create vk-public`), disable risky toolsets for that profile, use separate memory, and avoid sharing the owner session key with public traffic.
 
+## Inbound media forwarding
+
+For owner/trusted traffic the worker can include safe VK attachment references in the Hermes input. It does not download files itself in this slice; it forwards redacted VK CDN URLs for supported photo/doc attachments and records why unsupported media was skipped.
+
+Controls:
+
+```text
+VK_MEDIA_MAX_BYTES=10485760
+VK_MEDIA_ALLOWED_EXTS=jpg,jpeg,png,gif,webp,pdf,txt,md,csv,json
+```
+
+Rules:
+- only `owner` and `trusted` roles get media references;
+- public/group_chat attachments are never forwarded to Hermes, even when public Hermes replies are enabled;
+- docs over `VK_MEDIA_MAX_BYTES` or with unsupported extensions degrade to a short `not forwarded` note;
+- attachment access keys in rendered URLs are redacted before entering Hermes input/logs.
+
 ## Quick start
 
 1. Copy env template:

@@ -400,12 +400,87 @@ def help_text() -> str:
     ])
 
 
+def media_max_bytes() -> int:
+    return int_env("VK_MEDIA_MAX_BYTES", 10 * 1024 * 1024)
+
+
+def media_allowed_exts() -> set[str]:
+    raw = env("VK_MEDIA_ALLOWED_EXTS", "jpg,jpeg,png,gif,webp,pdf,txt,md,csv,json")
+    return {item.strip().lower().lstrip(".") for item in raw.split(",") if item.strip()}
+
+
+def _attachment_name(attachment: dict[str, Any]) -> str:
+    kind = str(attachment.get("type") or "attachment")
+    payload = attachment.get(kind) if isinstance(attachment.get(kind), dict) else {}
+    return str(payload.get("title") or payload.get("filename") or kind)
+
+
+def _best_photo_url(photo: dict[str, Any]) -> str:
+    sizes = photo.get("sizes") if isinstance(photo.get("sizes"), list) else []
+    best: dict[str, Any] | None = None
+    for size in sizes:
+        if not isinstance(size, dict) or not size.get("url"):
+            continue
+        if best is None:
+            best = size
+            continue
+        best_area = int(best.get("width") or 0) * int(best.get("height") or 0)
+        area = int(size.get("width") or 0) * int(size.get("height") or 0)
+        if area >= best_area:
+            best = size
+    return str((best or {}).get("url") or photo.get("url") or "")
+
+
+def media_forward_entries(vk: dict[str, Any]) -> list[str]:
+    attachments = vk.get("attachments") if isinstance(vk.get("attachments"), list) else []
+    if not attachments:
+        return []
+    role = str(decide_policy(vk).get("role") or "public")
+    trusted = role in {"owner", "trusted"}
+    entries: list[str] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        kind = str(attachment.get("type") or "unknown")
+        payload = attachment.get(kind) if isinstance(attachment.get(kind), dict) else {}
+        name = _attachment_name(attachment)
+        if not trusted:
+            entries.append(f"{name} not forwarded: untrusted_role")
+            continue
+        if kind == "photo":
+            url = _best_photo_url(payload)
+            if url:
+                entries.append(f"photo image forwarded: {redact_secrets(url)}")
+            else:
+                entries.append("photo attachment not forwarded: missing_url")
+            continue
+        if kind == "doc":
+            size = int(payload.get("size") or 0)
+            ext = str(payload.get("ext") or Path(name).suffix.lstrip(".")).lower()
+            url = str(payload.get("url") or "")
+            if size and size > media_max_bytes():
+                entries.append(f"{name} not forwarded: too_large")
+            elif ext and ext not in media_allowed_exts():
+                entries.append(f"{name} not forwarded: unsupported_ext")
+            elif not url:
+                entries.append(f"{name} not forwarded: missing_url")
+            else:
+                entries.append(f"doc {name} forwarded: {redact_secrets(url)}")
+            continue
+        entries.append(f"{kind} attachment not forwarded: unsupported_type")
+    return entries
+
+
 def build_hermes_input(vk: dict[str, Any]) -> str:
     attachments = vk["attachments"]
     attachment_summary = ""
     if attachments:
         types = ", ".join([str(a.get("type")) for a in attachments if isinstance(a, dict) and a.get("type")])
+        entries = media_forward_entries(vk)
+        detail = "\n".join(f"- {entry}" for entry in entries)
         attachment_summary = f"\n\n[VK attachments: {types}]"
+        if detail:
+            attachment_summary += f"\n{detail}"
     return f"{vk['text'] or '[empty VK message]'}{attachment_summary}"
 
 
