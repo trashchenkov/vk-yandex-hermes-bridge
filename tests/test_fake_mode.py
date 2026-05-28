@@ -30,7 +30,11 @@ def test_run_fake_event_owner_uses_fake_hermes_and_fake_vk_send(monkeypatch, tmp
     assert result["policy_decision"] == "reply"
     assert result["hermes_called"] is True
     assert result["outbound_messages"] == [
-        {"peer_id": "254662087", "message": "fake Hermes answer"}
+        {
+            "peer_id": "254662087",
+            "message": "fake Hermes answer",
+            "random_id": worker.stable_random_id(result["trace_id"], 0),
+        }
     ]
 
 
@@ -47,7 +51,11 @@ def test_run_fake_event_unknown_user_is_denied_without_fake_hermes(monkeypatch, 
     assert result["policy_decision"] == "deny"
     assert result["hermes_called"] is False
     assert result["outbound_messages"] == [
-        {"peer_id": "111111111", "message": "Бот приватный. Доступ к Hermes Agent ограничен."}
+        {
+            "peer_id": "111111111",
+            "message": "Бот приватный. Доступ к Hermes Agent ограничен.",
+            "random_id": worker.stable_random_id(result["trace_id"], 0),
+        }
     ]
 
 

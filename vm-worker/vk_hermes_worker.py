@@ -188,18 +188,17 @@ def call_hermes(vk: dict[str, Any]) -> str:
     return answer
 
 
-def split_for_vk(text: str) -> list[str]:
-    prefix = env("VK_REPLY_PREFIX", "")
-    remaining = f"{prefix}{text or ''}".strip() or "Готово."
+def _split_text_for_vk(text: str, max_chars: int) -> list[str]:
+    remaining = text.strip() or "Готово."
     chunks: list[str] = []
-    while len(remaining) > VK_MAX_MESSAGE_CHARS:
-        cut = remaining.rfind("\n\n", 0, VK_MAX_MESSAGE_CHARS)
-        if cut < VK_MAX_MESSAGE_CHARS // 2:
-            cut = remaining.rfind("\n", 0, VK_MAX_MESSAGE_CHARS)
-        if cut < VK_MAX_MESSAGE_CHARS // 2:
-            cut = remaining.rfind(" ", 0, VK_MAX_MESSAGE_CHARS)
+    while len(remaining) > max_chars:
+        cut = remaining.rfind("\n\n", 0, max_chars)
+        if cut < max_chars // 2:
+            cut = remaining.rfind("\n", 0, max_chars)
+        if cut < max_chars // 2:
+            cut = remaining.rfind(" ", 0, max_chars)
         if cut <= 0:
-            cut = VK_MAX_MESSAGE_CHARS
+            cut = max_chars
         chunks.append(remaining[:cut].strip())
         remaining = remaining[cut:].strip()
     if remaining:
@@ -207,7 +206,40 @@ def split_for_vk(text: str) -> list[str]:
     return chunks
 
 
-def send_vk_message(peer_id: str, message: str) -> None:
+def split_for_vk(text: str) -> list[str]:
+    prefix = env("VK_REPLY_PREFIX", "")
+    return _split_text_for_vk(f"{prefix}{text or ''}", VK_MAX_MESSAGE_CHARS)
+
+
+def stable_random_id(trace_id: str, chunk_index: int) -> int:
+    raw = f"{trace_id}:{chunk_index}".encode("utf-8")
+    # VK accepts signed 32-bit integers except zero; keep it positive and stable.
+    return int(hashlib.sha256(raw).hexdigest()[:8], 16) % 2_147_483_647 or 1
+
+
+def build_vk_outbound_messages(peer_id: str, text: str, *, trace_id: str) -> list[dict[str, Any]]:
+    prefix = env("VK_REPLY_PREFIX", "")
+    base_text = f"{prefix}{text or ''}".strip() or "Готово."
+    chunks = _split_text_for_vk(base_text, VK_MAX_MESSAGE_CHARS)
+    if len(chunks) > 1:
+        numbered: list[str] = []
+        total = len(_split_text_for_vk(base_text, VK_MAX_MESSAGE_CHARS - 16))
+        chunks = _split_text_for_vk(base_text, VK_MAX_MESSAGE_CHARS - len(f"[{total}/{total}]\n"))
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            numbered.append(f"[{index}/{total}]\n{chunk}")
+        chunks = numbered
+    return [
+        {
+            "peer_id": str(peer_id),
+            "message": chunk,
+            "random_id": stable_random_id(trace_id, index),
+        }
+        for index, chunk in enumerate(chunks)
+    ]
+
+
+def send_vk_message(peer_id: str, message: str, *, random_id: int | None = None) -> None:
     token = env("VK_GROUP_TOKEN")
     if not token:
         raise RuntimeError("VK_GROUP_TOKEN is required")
@@ -215,7 +247,7 @@ def send_vk_message(peer_id: str, message: str) -> None:
         "access_token": token,
         "v": env("VK_API_VERSION", "5.199"),
         "peer_id": str(peer_id),
-        "random_id": str(random.randint(1, 2_147_483_647)),
+        "random_id": str(random_id if random_id is not None else random.randint(1, 2_147_483_647)),
         "message": message,
     }
     res = requests.post("https://api.vk.com/method/messages.send", data=data, timeout=30)
@@ -224,9 +256,10 @@ def send_vk_message(peer_id: str, message: str) -> None:
         raise RuntimeError(f"VK messages.send failed: HTTP {res.status_code} {str(payload.get('error') or payload)[:500]}")
 
 
-def reply_vk(peer_id: str, text: str) -> None:
-    for chunk in split_for_vk(text):
-        send_vk_message(peer_id, chunk)
+def reply_vk(peer_id: str, text: str, *, trace_id: str | None = None) -> None:
+    actual_trace_id = trace_id or f"vk-send-{hashlib.sha256(f'{peer_id}:{text}'.encode('utf-8')).hexdigest()[:16]}"
+    for outbound in build_vk_outbound_messages(peer_id, text, trace_id=actual_trace_id):
+        send_vk_message(outbound["peer_id"], outbound["message"], random_id=outbound["random_id"])
 
 
 def event_fingerprint(payload: dict[str, Any]) -> str:
@@ -308,31 +341,32 @@ def build_event_envelope(payload: dict[str, Any]) -> dict[str, Any]:
 
 def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
     vk = normalize_vk_message(payload)
+    trace_id = trace_id_for_payload(payload)
     if not vk["peer_id"]:
-        LOG.info("skip payload without peer_id")
+        LOG.info("skip payload without peer_id trace_id=%s", trace_id)
         return
     if vk["message"].get("out"):
-        LOG.info("skip outgoing VK message")
+        LOG.info("skip outgoing VK message trace_id=%s", trace_id)
         return
 
     key = event_fingerprint(payload)
     if dedup.seen(key):
-        LOG.info("skip duplicate event %s", key[:12])
+        LOG.info("skip duplicate event %s trace_id=%s", key[:12], trace_id)
         return
 
     if not is_authorized(vk):
-        LOG.warning("unauthorized VK user from_id=%s peer_id=%s", vk["from_id"], vk["peer_id"])
+        LOG.warning("unauthorized VK user from_id=%s peer_id=%s trace_id=%s", vk["from_id"], vk["peer_id"], trace_id)
         reply = unauthorized_reply_text()
         if reply:
-            reply_vk(vk["peer_id"], reply)
+            reply_vk(vk["peer_id"], reply, trace_id=trace_id)
         dedup.mark(key)
         return
 
     if is_help_command(vk["text"]):
-        reply_vk(vk["peer_id"], help_text())
+        reply_vk(vk["peer_id"], help_text(), trace_id=trace_id)
     else:
         answer = call_hermes(vk)
-        reply_vk(vk["peer_id"], answer)
+        reply_vk(vk["peer_id"], answer, trace_id=trace_id)
     dedup.mark(key)
 
 
@@ -344,7 +378,7 @@ def run_fake_event(
 ) -> dict[str, Any]:
     payload = json.loads(Path(fixture_path).read_text(encoding="utf-8"))
     vk = normalize_vk_message(payload)
-    outbound: list[dict[str, str]] = []
+    outbound: list[dict[str, Any]] = []
     hermes_called = False
 
     def fake_call_hermes(_: dict[str, Any]) -> str:
@@ -352,9 +386,9 @@ def run_fake_event(
         hermes_called = True
         return fake_hermes_answer
 
-    def fake_reply_vk(peer_id: str, text: str) -> None:
-        for chunk in split_for_vk(text):
-            outbound.append({"peer_id": str(peer_id), "message": chunk})
+    def fake_reply_vk(peer_id: str, text: str, *, trace_id: str | None = None) -> None:
+        actual_trace_id = trace_id or trace_id_for_payload(payload)
+        outbound.extend(build_vk_outbound_messages(peer_id, text, trace_id=actual_trace_id))
 
     original_call_hermes = globals()["call_hermes"]
     original_reply_vk = globals()["reply_vk"]
