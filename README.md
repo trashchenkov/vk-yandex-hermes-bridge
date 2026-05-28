@@ -39,7 +39,7 @@ This repository is intended for private agent access, even if the VK community i
 - Set `VK_ALLOWED_USERS=<your_vk_user_id>` on the VM worker.
 - Do not set `VK_ALLOW_ALL_USERS=true` outside short smoke tests.
 
-Unknown VK users are blocked before any Hermes call. By default they receive: `Бот приватный. Доступ к Hermes Agent ограничен.` Set `VK_UNAUTHORIZED_REPLY=` to silently ignore them.
+Unknown VK users are blocked before any Hermes call. By default they receive: `Бот приватный. Доступ к Hermes Agent ограничен.` Set `VK_UNAUTHORIZED_MODE=ignore` to silently ignore them, `notify_owner` to send only an owner alert, or `reply_and_notify` to do both. Owner alerts use `VK_OWNER_PEER_ID` and include only sanitized sender/trace/text preview metadata.
 
 ## Quick start
 

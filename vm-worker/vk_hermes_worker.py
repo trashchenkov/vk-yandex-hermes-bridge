@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import sys
 import time
@@ -160,6 +161,52 @@ def is_authorized(vk: dict[str, Any]) -> bool:
 
 def unauthorized_reply_text() -> str:
     return env("VK_UNAUTHORIZED_REPLY", "Бот приватный. Доступ к Hermes Agent ограничен.").strip()
+
+
+def unauthorized_mode() -> str:
+    mode = env("VK_UNAUTHORIZED_MODE", "reply").strip().lower()
+    return mode if mode in {"ignore", "reply", "notify_owner", "reply_and_notify"} else "reply"
+
+
+def owner_notification_peer_id() -> str:
+    explicit = env("VK_OWNER_PEER_ID").strip()
+    if explicit:
+        return explicit
+    owners = sorted(owner_vk_users())
+    return owners[0] if owners else ""
+
+
+def redact_notification_text(text: str) -> str:
+    redacted = re.sub(r"(?i)\b[A-Z0-9_]*(?:token|secret|key|password|memory)[A-Z0-9_]*\b", "[redacted]", text)
+    redacted = re.sub(r"(?i)(access_key\s*=\s*)\S+", r"\1[redacted]", redacted)
+    redacted = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", redacted)
+    return redacted
+
+
+def format_owner_unauthorized_notification(vk: dict[str, Any], trace_id: str, decision: dict[str, Any]) -> str:
+    preview = redact_notification_text(str(vk.get("text") or "").replace("\n", " "))[:240]
+    attachment_types = ",".join([str(a.get("type")) for a in vk.get("attachments", []) if isinstance(a, dict) and a.get("type")]) or "none"
+    return "\n".join([
+        "Unauthorized VK message",
+        f"trace={trace_id}",
+        f"from={vk.get('from_id', '')}",
+        f"peer={vk.get('peer_id', '')}",
+        f"role={decision.get('role', '')}",
+        f"decision={decision.get('action', '')}",
+        f"reason={decision.get('reason', '')}",
+        f"date={vk.get('message', {}).get('date') or ''}",
+        f"attachments={attachment_types}",
+        f"text={preview}",
+    ])
+
+
+def notify_owner_about_unauthorized(vk: dict[str, Any], trace_id: str, decision: dict[str, Any]) -> bool:
+    peer_id = owner_notification_peer_id()
+    if not peer_id:
+        LOG.warning("owner notification skipped trace_id=%s reason=missing_owner_peer_id", trace_id)
+        return False
+    reply_vk(peer_id, format_owner_unauthorized_notification(vk, trace_id, decision), trace_id=trace_id)
+    return True
 
 
 def is_help_command(text: str) -> bool:
@@ -649,9 +696,16 @@ def process_payload(
                     from_id=vk["from_id"],
                     text=vk["text"],
                 )
-            reply = unauthorized_reply_text()
-            if reply:
-                reply_vk(vk["peer_id"], reply, trace_id=trace_id)
+            mode = unauthorized_mode()
+            sent_any = False
+            if mode in {"reply", "reply_and_notify"}:
+                reply = unauthorized_reply_text()
+                if reply:
+                    reply_vk(vk["peer_id"], reply, trace_id=trace_id)
+                    sent_any = True
+            if mode in {"notify_owner", "reply_and_notify"}:
+                sent_any = notify_owner_about_unauthorized(vk, trace_id, decision) or sent_any
+            if sent_any:
                 trace_record["vk_status"] = "sent"
             save_trace(trace_store, trace_record)
             dedup.mark(key)
