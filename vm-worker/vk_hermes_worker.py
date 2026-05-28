@@ -824,6 +824,126 @@ def run_fake_event(
     }
 
 
+def run_replay_fixture(
+    fixture_path: str | Path,
+    *,
+    fake_hermes_answer: str = "Fake Hermes response.",
+    dedup_path: str | Path = ":memory:",
+) -> dict[str, Any]:
+    fixture = Path(fixture_path)
+    try:
+        payload = json.loads(fixture.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"fixture": str(fixture), "status": "error", "ok": False, "error": f"failed to read fixture: {exc}"}
+
+    simulate = str((payload.get("_replay") or {}).get("simulate") or "ok") if isinstance(payload, dict) else "ok"
+    vk = normalize_vk_message(payload) if isinstance(payload, dict) else {"peer_id": "", "message": {}, "attachments": [], "text": ""}
+    outbound: list[dict[str, Any]] = []
+    hermes_called = False
+    error = ""
+
+    def fake_call_hermes(_: dict[str, Any]) -> str:
+        nonlocal hermes_called
+        hermes_called = True
+        if simulate == "hermes_timeout":
+            raise TimeoutError("simulated Hermes timeout")
+        return fake_hermes_answer
+
+    def fake_reply_vk(peer_id: str, text: str, *, trace_id: str | None = None) -> None:
+        if simulate == "vk_send_failure":
+            raise RuntimeError("simulated VK send failure")
+        actual_trace_id = trace_id or (trace_id_for_payload(payload) if isinstance(payload, dict) else "replay")
+        outbound.extend(build_vk_outbound_messages(peer_id, text, trace_id=actual_trace_id))
+
+    original_call_hermes = globals()["call_hermes"]
+    original_reply_vk = globals()["reply_vk"]
+    globals()["call_hermes"] = fake_call_hermes
+    globals()["reply_vk"] = fake_reply_vk
+    trace_store = TraceStore(":memory:")
+    duplicate_skipped = False
+    try:
+        if isinstance(payload, dict):
+            dedup = DedupStore(dedup_path)
+            try:
+                process_payload(payload, dedup, trace_store=trace_store)
+                if simulate == "duplicate":
+                    first_count = len(outbound)
+                    process_payload(payload, dedup, trace_store=trace_store)
+                    duplicate_skipped = len(outbound) == first_count
+            except Exception as exc:
+                error = str(exc)[:500]
+        else:
+            error = "fixture root is not a JSON object"
+    finally:
+        globals()["call_hermes"] = original_call_hermes
+        globals()["reply_vk"] = original_reply_vk
+
+    if isinstance(payload, dict):
+        if not vk["peer_id"]:
+            policy = {"role": role_for_vk(vk), "action": "skip", "hermes_allowed": False, "reason": "missing_peer_id"}
+        elif vk["message"].get("out"):
+            policy = {"role": role_for_vk(vk), "action": "skip", "hermes_allowed": False, "reason": "outgoing_message"}
+        else:
+            policy = decide_policy(vk)
+        envelope = build_event_envelope(payload)
+        trace_id = envelope["trace_id"]
+    else:
+        policy = {"role": "public", "action": "skip", "hermes_allowed": False, "reason": "invalid_fixture"}
+        envelope = {}
+        trace_id = ""
+
+    return {
+        "fixture": str(fixture),
+        "status": "error" if error else "ok",
+        "ok": True,
+        "error": error,
+        "trace_id": trace_id,
+        "envelope": envelope,
+        "role": policy["role"],
+        "policy_decision": policy["action"],
+        "policy": policy,
+        "hermes_called": hermes_called,
+        "outbound_messages": outbound,
+        "duplicate_skipped": duplicate_skipped,
+        "simulate": simulate,
+    }
+
+
+def run_replay(
+    fixture_paths: list[str | Path],
+    *,
+    fake_hermes_answer: str = "Fake Hermes response.",
+    dedup_path: str | Path = ":memory:",
+) -> dict[str, Any]:
+    results = [
+        run_replay_fixture(path, fake_hermes_answer=fake_hermes_answer, dedup_path=dedup_path)
+        for path in fixture_paths
+    ]
+    return {"ok": all(result.get("ok") for result in results), "results": results}
+
+
+def format_replay_report(report: dict[str, Any]) -> str:
+    lines = [f"Replay: {'OK' if report.get('ok') else 'FAIL'}"]
+    for result in report.get("results") or []:
+        fixture = Path(str(result.get("fixture") or "")).name
+        line = " ".join([
+            f"[{result.get('status')}] {fixture}",
+            f"decision={result.get('policy_decision')}",
+            f"role={result.get('role')}",
+            f"hermes_called={result.get('hermes_called')}",
+            f"outbound={len(result.get('outbound_messages') or [])}",
+            f"duplicate_skipped={result.get('duplicate_skipped')}",
+            f"trace={result.get('trace_id')}",
+        ])
+        if result.get("error"):
+            line = f"{line} error={result.get('error')}"
+        outbound = (result.get("outbound_messages") or [])[-1] if result.get("outbound_messages") else None
+        if outbound:
+            line = f"{line} final_outbound={json.dumps(outbound, ensure_ascii=False, separators=(',', ':'))}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def smoke_check(name: str, ok: bool, detail: str, **extra: Any) -> dict[str, Any]:
     check: dict[str, Any] = {"name": name, "status": "ok" if ok else "fail", "detail": detail}
     check.update(extra)
@@ -1043,7 +1163,8 @@ def main() -> int:
     parser.add_argument("--trace-db", help="SQLite trace store path")
     parser.add_argument("--review-db", help="SQLite review inbox path")
     parser.add_argument("--fake-event", help="process a saved VK event fixture without VK/Yandex/Hermes secrets")
-    parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event")
+    parser.add_argument("--replay", nargs="+", help="replay one or more saved VK event fixtures with fake Hermes/VK sends")
+    parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event/--replay")
     parser.add_argument("--doctor", action="store_true", help="check required config and local state stores")
     parser.add_argument("--doctor-network", action="store_true", help="also check Hermes API /health")
     parser.add_argument("--smoke", action="store_true", help="run fake owner/public E2E smoke checks")
@@ -1067,6 +1188,15 @@ def main() -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+
+    if args.replay:
+        report = run_replay(
+            args.replay,
+            fake_hermes_answer=args.fake_hermes_answer,
+            dedup_path=args.dedup_db or ":memory:",
+        )
+        print(format_replay_report(report))
+        return 0 if report["ok"] else 2
 
     if args.doctor:
         report = run_doctor(

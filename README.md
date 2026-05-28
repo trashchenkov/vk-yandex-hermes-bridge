@@ -43,6 +43,17 @@ Unknown VK users are blocked before any Hermes call. By default they receive: `Ð
 
 Set `VK_SHADOW_MODE=true` to test allowed-user traffic safely: the worker calls Hermes and stores trace status, but does not send the proposed answer to the original VK peer. Instead it sends a sanitized `Shadow VK answer` report to `VK_OWNER_PEER_ID`.
 
+## Local replay and smoke checks
+
+Use fake local checks before touching live VK/Yandex/Hermes credentials:
+
+```bash
+python vm-worker/vk_hermes_worker.py --smoke
+python vm-worker/vk_hermes_worker.py --replay fixtures/vk/message_new_owner.json fixtures/vk/duplicate_event.json
+```
+
+`--replay` uses fake Hermes/VK sends and prints policy decisions, trace IDs, outbound payload shape, duplicate handling, and simulated failure outcomes for fixtures such as `hermes_timeout.json` and `vk_send_failure.json`.
+
 ## Quick start
 
 1. Copy env template:

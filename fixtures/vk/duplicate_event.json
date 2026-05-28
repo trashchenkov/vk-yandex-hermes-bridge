@@ -1,0 +1,18 @@
+{
+  "type": "message_new",
+  "event_id": "duplicate-event-1",
+  "group_id": 123456789,
+  "_replay": {
+    "simulate": "duplicate"
+  },
+  "object": {
+    "message": {
+      "id": 201,
+      "conversation_message_id": 201,
+      "peer_id": 254662087,
+      "from_id": 254662087,
+      "text": "Проверка duplicate replay",
+      "attachments": []
+    }
+  }
+}

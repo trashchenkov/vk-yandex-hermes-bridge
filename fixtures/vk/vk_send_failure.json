@@ -1,0 +1,18 @@
+{
+  "type": "message_new",
+  "event_id": "vk-send-failure-event-1",
+  "group_id": 123456789,
+  "_replay": {
+    "simulate": "vk_send_failure"
+  },
+  "object": {
+    "message": {
+      "id": 203,
+      "conversation_message_id": 203,
+      "peer_id": 254662087,
+      "from_id": 254662087,
+      "text": "Сымитируй ошибку отправки VK",
+      "attachments": []
+    }
+  }
+}
