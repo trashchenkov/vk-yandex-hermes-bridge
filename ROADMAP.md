@@ -2,6 +2,8 @@
 
 This roadmap focuses on turning the bridge from a working VK-to-Hermes deployment recipe into a safe, observable, reusable community-assistant toolkit.
 
+Current MVP scope is locked in `docs/MVP.md`; implementation-ready MVP issue drafts are in `docs/mvp-issues.md`.
+
 ## Guiding principles
 
 - Keep Hermes private by default: no public inbound access to the Hermes API Server.

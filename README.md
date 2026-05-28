@@ -144,7 +144,9 @@ bash -n scripts/build-yandex-function-zip.sh
 
 ## Roadmap
 
-See `ROADMAP.md` for planned hardening and product features: doctor/security checks, CI, replay tooling, shadow mode, VK Long Poll mode, policy engine, public FAQ/RAG mode, owner approvals, and native Hermes platform-plugin direction.
+See `docs/MVP.md` for the current MVP scope and `docs/mvp-issues.md` for implementation-ready issue drafts.
+
+See `ROADMAP.md` for the broader roadmap: doctor/security checks, CI, replay tooling, shadow mode, VK Long Poll mode, policy engine, public FAQ/RAG mode, owner approvals, and native Hermes platform-plugin direction.
 
 ## Operational notes
 
