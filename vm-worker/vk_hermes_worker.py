@@ -110,7 +110,7 @@ def resolve_role(vk: dict[str, Any]) -> str:
     return "public"
 
 
-OWNER_COMMANDS = {"trace", "pending", "approve", "reject"}
+OWNER_COMMANDS = {"trace", "pending", "approve", "reject", "reply"}
 
 
 def parse_owner_command(text: str) -> dict[str, Any] | None:
@@ -577,6 +577,22 @@ def handle_owner_command(
         except (KeyError, ValueError):
             return f"Review item #{args[0]} not found."
         return f"Review item #{item['id']} {item['status']}."
+    if command == "reply":
+        if len(args) < 2:
+            return "Usage: !reply <review_id> <text>"
+        if not review_store:
+            return "Review store is not configured."
+        item_id = args[0]
+        reply_text = " ".join(args[1:]).strip()
+        try:
+            item = review_store.get(item_id)
+        except ValueError:
+            item = None
+        if not item:
+            return f"Review item #{item_id} not found."
+        reply_vk(str(item["peer_id"]), reply_text)
+        updated = review_store.update_status(item_id, "replied")
+        return f"Manual reply sent for review item #{updated['id']}."
     return f"Owner command !{command} accepted, but it is not implemented yet."
 
 

@@ -113,3 +113,37 @@ def test_pending_approve_and_reject_owner_commands_use_review_store(monkeypatch,
         review_store=review_store,
     ) == f"Review item #{second['id']} rejected."
     assert review_store.get(second["id"])["status"] == "rejected"
+
+
+def test_reply_owner_command_sends_manual_reply_and_marks_item_replied(monkeypatch, tmp_path):
+    worker = load_worker()
+    monkeypatch.setenv("VK_OWNER_ID", "1")
+    review_store = worker.ReviewStore(tmp_path / "review.sqlite3")
+    item = review_store.create_item(kind="public_question", trace_id="vk-target", peer_id="9", from_id="9", text="question")
+    sent = []
+    monkeypatch.setattr(worker, "call_hermes", lambda vk: (_ for _ in ()).throw(AssertionError("Hermes must not be called")))
+    monkeypatch.setattr(worker, "reply_vk", lambda peer_id, message, **kwargs: sent.append((peer_id, message, kwargs)))
+
+    payload = vk_event(1, f"!reply {item['id']} Ответ вручную")
+    worker.process_payload(payload, worker.DedupStore(tmp_path / "dedup.sqlite3"), review_store=review_store)
+
+    assert sent[0][0] == "9"
+    assert sent[0][1] == "Ответ вручную"
+    assert sent[1][0] == "1"
+    assert sent[1][1] == f"Manual reply sent for review item #{item['id']}."
+    assert review_store.get(item["id"])["status"] == "replied"
+
+
+def test_reply_owner_command_requires_text_and_existing_review_item(monkeypatch, tmp_path):
+    worker = load_worker()
+    monkeypatch.setenv("VK_OWNER_ID", "1")
+    sent = []
+    monkeypatch.setattr(worker, "reply_vk", lambda peer_id, message, **kwargs: sent.append((peer_id, message, kwargs)))
+
+    worker.process_payload(
+        vk_event(1, "!reply 999"),
+        worker.DedupStore(tmp_path / "dedup.sqlite3"),
+        review_store=worker.ReviewStore(tmp_path / "review.sqlite3"),
+    )
+
+    assert sent == [("1", "Usage: !reply <review_id> <text>", {"trace_id": worker.trace_id_for_payload(vk_event(1, "!reply 999"))})]

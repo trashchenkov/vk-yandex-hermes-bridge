@@ -8,7 +8,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER_PATH = ROOT / "vm-worker" / "vk_hermes_worker.py"
-OWNER_COMMANDS = ["!trace vk-abc", "!pending", "!approve 42", "!reject 42"]
+OWNER_COMMANDS = ["!trace vk-abc", "!pending", "!approve 42", "!reject 42", "!reply 42 hello"]
 
 
 def load_worker():
