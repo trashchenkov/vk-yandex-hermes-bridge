@@ -61,3 +61,7 @@ jobs:
           bash -n scripts/setup-hermes-api-server.sh
           bash -n scripts/install-vk-hermes-worker-service.sh
           bash -n scripts/build-yandex-function-zip.sh
+          bash -n scripts/deploy-yandex-function.sh
+
+      - name: Check Docker Compose config
+        run: docker compose config >/dev/null

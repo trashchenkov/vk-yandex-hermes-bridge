@@ -19,6 +19,8 @@ def test_ci_workflow_exists_and_runs_required_checks():
         "bash -n scripts/setup-hermes-api-server.sh",
         "bash -n scripts/install-vk-hermes-worker-service.sh",
         "bash -n scripts/build-yandex-function-zip.sh",
+        "bash -n scripts/deploy-yandex-function.sh",
+        "docker compose config",
     ]
     for phrase in required:
         assert phrase in text
