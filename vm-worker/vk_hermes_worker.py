@@ -306,6 +306,12 @@ def trace_id_for_payload(payload: dict[str, Any]) -> str:
     return f"vk-{event_fingerprint(payload)[:16]}"
 
 
+def raw_event_hash(payload: dict[str, Any]) -> str:
+    """Return a stable hash of the raw inbound event without storing raw data."""
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def summarize_attachments(attachments: list[Any]) -> list[dict[str, str]]:
     """Return a safe attachment summary without nested VK access keys/tokens."""
     summary: list[dict[str, str]] = []
@@ -322,20 +328,23 @@ def build_event_envelope(payload: dict[str, Any]) -> dict[str, Any]:
     """Build the internal traceable event envelope used by fake and real paths."""
     vk = normalize_vk_message(payload)
     message = vk["message"]
+    attachments = summarize_attachments(vk["attachments"])
     return {
         "trace_id": trace_id_for_payload(payload),
         "event_type": str(payload.get("type") or ""),
-        "timestamp": message.get("date") or payload.get("date"),
+        "message_timestamp": message.get("date") or payload.get("date"),
         "vk": {
+            "group_id": str(payload.get("group_id") or ""),
+            "event_id": str(payload.get("event_id") or ""),
             "peer_id": vk["peer_id"],
             "from_id": vk["from_id"],
             "message_id": vk["message_id"],
-            "group_id": str(payload.get("group_id") or ""),
-            "event_id": str(payload.get("event_id") or ""),
+            "conversation_message_id": str(message.get("conversation_message_id") or ""),
         },
         "text": vk["text"],
-        "attachments": summarize_attachments(vk["attachments"]),
-        "raw_event_sha256": event_fingerprint(payload),
+        "attachment_types": [item["type"] for item in attachments],
+        "attachments": attachments,
+        "raw_event_sha256": raw_event_hash(payload),
     }
 
 
@@ -354,14 +363,22 @@ def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
         LOG.info("skip duplicate event %s trace_id=%s", key[:12], trace_id)
         return
 
-    if not is_authorized(vk):
-        LOG.warning("unauthorized VK user from_id=%s peer_id=%s trace_id=%s", vk["from_id"], vk["peer_id"], trace_id)
+    role = role_for_vk(vk)
+    if role != "owner":
+        LOG.warning(
+            "policy decision trace_id=%s role=%s decision=deny from_id=%s peer_id=%s",
+            trace_id,
+            role,
+            vk["from_id"],
+            vk["peer_id"],
+        )
         reply = unauthorized_reply_text()
         if reply:
             reply_vk(vk["peer_id"], reply, trace_id=trace_id)
         dedup.mark(key)
         return
 
+    LOG.info("policy decision trace_id=%s role=%s decision=reply", trace_id, role)
     if is_help_command(vk["text"]):
         reply_vk(vk["peer_id"], help_text(), trace_id=trace_id)
     else:
@@ -411,8 +428,10 @@ def run_fake_event(
     else:
         decision = "deny"
 
+    envelope = build_event_envelope(payload)
     return {
-        "trace_id": trace_id_for_payload(payload),
+        "trace_id": envelope["trace_id"],
+        "envelope": envelope,
         "role": role,
         "policy_decision": decision,
         "hermes_called": hermes_called,
