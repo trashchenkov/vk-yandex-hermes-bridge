@@ -109,32 +109,82 @@ def env_id_set(name: str) -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def _load_policy_json() -> dict[str, Any]:
+    raw = env("VK_POLICY_JSON").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError as exc:
+            LOG.warning("invalid VK_POLICY_JSON: %s", exc)
+            return {}
+    policy_file = env("VK_POLICY_FILE").strip()
+    if policy_file:
+        try:
+            data = json.loads(Path(policy_file).read_text(errors="replace"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError) as exc:
+            LOG.warning("invalid VK_POLICY_FILE %s: %s", policy_file, exc)
+            return {}
+    return {}
+
+
+def policy_config() -> dict[str, Any]:
+    return _load_policy_json()
+
+
+def _policy_role_ids(config: dict[str, Any], role: str) -> set[str]:
+    roles = config.get("roles") if isinstance(config.get("roles"), dict) else {}
+    spec = roles.get(role) if isinstance(roles.get(role), dict) else {}
+    ids = spec.get("ids") or []
+    return {str(item).strip() for item in ids if str(item).strip()}
+
+
+def _is_group_peer(peer_id: str) -> bool:
+    try:
+        return int(peer_id) >= 2_000_000_000
+    except ValueError:
+        return False
+
+
 def allowed_vk_users() -> set[str]:
     return env_id_set("VK_ALLOWED_USERS")
 
 
 def owner_vk_users() -> set[str]:
+    config = policy_config()
+    if config:
+        return _policy_role_ids(config, "owner")
     # VK_ALLOWED_USERS is the legacy owner allowlist; once VK_OWNER_ID is set, it is authoritative.
     explicit = env_id_set("VK_OWNER_ID")
     return explicit or allowed_vk_users()
 
 
 def trusted_vk_users() -> set[str]:
+    config = policy_config()
+    if config:
+        return _policy_role_ids(config, "trusted")
     return env_id_set("VK_TRUSTED_USERS")
 
 
 def blocked_vk_users() -> set[str]:
+    config = policy_config()
+    if config:
+        return _policy_role_ids(config, "blocked")
     return env_id_set("VK_BLOCKED_USERS")
 
 
 def resolve_role(vk: dict[str, Any]) -> str:
+    config = policy_config()
     sender = str(vk.get("from_id") or "")
     if sender in blocked_vk_users():
         return "blocked"
     if sender in owner_vk_users():
         return "owner"
-    if sender in trusted_vk_users() or truthy_env("VK_ALLOW_ALL_USERS"):
+    if sender in trusted_vk_users() or (not config and truthy_env("VK_ALLOW_ALL_USERS")):
         return "trusted"
+    if config and _is_group_peer(str(vk.get("peer_id") or "")):
+        return "group_chat"
     return "public"
 
 
@@ -162,7 +212,33 @@ def emergency_lockdown_enabled() -> bool:
     return truthy_env("VK_EMERGENCY_LOCKDOWN") or truthy_env("VK_LOCKDOWN")
 
 
+def _configured_rule(config: dict[str, Any], role: str) -> dict[str, Any] | None:
+    rules = config.get("rules") if isinstance(config.get("rules"), dict) else {}
+    rule = rules.get(role)
+    if not isinstance(rule, dict):
+        return None
+    action = str(rule.get("action") or "deny")
+    return {
+        "role": role,
+        "action": action,
+        "hermes_allowed": bool(rule.get("hermes_allowed", action == "reply")),
+        "reason": str(rule.get("reason") or f"configured_{role}_{action}"),
+    }
+
+
+def _group_mention_required_decision(config: dict[str, Any], vk: dict[str, Any]) -> dict[str, Any] | None:
+    group_cfg = config.get("group_chats") if isinstance(config.get("group_chats"), dict) else {}
+    if not group_cfg.get("require_mention"):
+        return None
+    mentions = [str(item).lower() for item in (group_cfg.get("mentions") or []) if str(item).strip()]
+    text = str(vk.get("text") or "").lower()
+    if mentions and not any(mention in text for mention in mentions):
+        return {"role": "group_chat", "action": "deny", "hermes_allowed": False, "reason": "group_mention_required"}
+    return None
+
+
 def decide_policy(vk: dict[str, Any]) -> dict[str, Any]:
+    config = policy_config()
     role = resolve_role(vk)
     text = str(vk.get("text") or "")
     command = parse_owner_command(text)
@@ -170,12 +246,21 @@ def decide_policy(vk: dict[str, Any]) -> dict[str, Any]:
         return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "blocked_user"}
     if emergency_lockdown_enabled() and role != "owner":
         return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "emergency_lockdown"}
+    if role == "group_chat":
+        mention_decision = _group_mention_required_decision(config, vk)
+        if mention_decision:
+            return mention_decision
     if command:
         if role == "owner":
             return {"role": role, "action": "owner_command", "hermes_allowed": False, "reason": "owner_command", **command}
         return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "owner_command_requires_owner", **command}
+    configured = _configured_rule(config, role) if config else None
+    if configured:
+        return configured
     if role in {"owner", "trusted"}:
         return {"role": role, "action": "reply", "hermes_allowed": True, "reason": "allowed_user"}
+    if role == "group_chat":
+        return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "group_default_deny"}
     if truthy_env("VK_PUBLIC_HANDOFF"):
         return {"role": role, "action": "handoff", "hermes_allowed": False, "reason": "public_handoff"}
     return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "public_default_deny"}

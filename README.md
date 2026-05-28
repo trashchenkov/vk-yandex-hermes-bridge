@@ -65,6 +65,29 @@ python vm-worker/vk_hermes_worker.py --long-poll --health
 
 For machine-parseable production logs set `LOG_FORMAT=json`. JSON logs include timestamp, level, logger and redacted message text.
 
+## Policy engine
+
+By default the worker keeps the legacy private policy: `VK_OWNER_ID` / `VK_ALLOWED_USERS` are owners, `VK_TRUSTED_USERS` may reach Hermes, unknown users are denied unless `VK_PUBLIC_HANDOFF=true`.
+
+For explicit env/file-configured rules, set `VK_POLICY_JSON` or `VK_POLICY_FILE`. When present, policy roles from the JSON override the legacy allowlist envs:
+
+```json
+{
+  "roles": {
+    "owner": {"ids": ["123456789"]},
+    "trusted": {"ids": ["234567890"]},
+    "blocked": {"ids": []}
+  },
+  "rules": {
+    "public": {"action": "deny", "hermes_allowed": false, "reason": "configured_public_deny"},
+    "trusted": {"action": "reply", "hermes_allowed": true, "reason": "trusted_user"}
+  },
+  "group_chats": {"require_mention": true, "mentions": ["гермес", "@club123"]}
+}
+```
+
+Owner commands still require the `owner` role. Group chats are denied unless configured mention triggers are present; even then they default to deny until a later public/RAG mode adds a safe answer path.
+
 ## Quick start
 
 1. Copy env template:
