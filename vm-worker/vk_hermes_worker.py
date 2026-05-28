@@ -208,6 +208,26 @@ def is_owner_command(text: str) -> bool:
     return parse_owner_command(text) is not None
 
 
+def policy_has_public_hermes_reply() -> bool:
+    config = policy_config()
+    rules = config.get("rules") if isinstance(config.get("rules"), dict) else {}
+    for role in ("public", "group_chat"):
+        rule = rules.get(role)
+        if isinstance(rule, dict) and bool(rule.get("hermes_allowed")):
+            return True
+    return False
+
+
+def hermes_public_is_separate() -> bool:
+    return bool(
+        env("HERMES_PUBLIC_PROFILE")
+        or env("HERMES_PUBLIC_API_KEY")
+        or env("HERMES_PUBLIC_API_BASE")
+        or env("HERMES_PUBLIC_MODEL")
+        or env("HERMES_PUBLIC_SESSION_PREFIX")
+    )
+
+
 def emergency_lockdown_enabled() -> bool:
     return truthy_env("VK_EMERGENCY_LOCKDOWN") or truthy_env("VK_LOCKDOWN")
 
@@ -420,25 +440,54 @@ def extract_hermes_text(data: Any) -> str:
     return ""
 
 
-def call_hermes(vk: dict[str, Any]) -> str:
-    base = env("HERMES_API_BASE", "http://127.0.0.1:8642").rstrip("/")
+def call_hermes_config(vk: dict[str, Any]) -> dict[str, str]:
+    policy = decide_policy(vk)
+    role = str(policy.get("role") or "")
+    public_role = role in {"public", "group_chat"}
+    use_public = public_role and bool(policy.get("hermes_allowed"))
+    base = env("HERMES_API_BASE", "http://127.0.0.1:8642")
     key = env("HERMES_API_KEY") or env("API_SERVER_KEY")
+    model = env("HERMES_MODEL", "hermes-agent")
+    session_prefix = env("HERMES_SESSION_PREFIX", "vk") or "vk"
+    profile = env("HERMES_PROFILE")
+    if use_public:
+        base = env("HERMES_PUBLIC_API_BASE", base) or base
+        key = env("HERMES_PUBLIC_API_KEY") or key
+        model = env("HERMES_PUBLIC_MODEL", model) or model
+        session_prefix = env("HERMES_PUBLIC_SESSION_PREFIX", "vk-public") or "vk-public"
+        profile = env("HERMES_PUBLIC_PROFILE") or profile
+    return {
+        "base": base.rstrip("/"),
+        "key": key,
+        "model": model,
+        "session_key": f"{session_prefix}:{vk['peer_id']}",
+        "profile": profile,
+    }
+
+
+def call_hermes(vk: dict[str, Any]) -> str:
+    config = call_hermes_config(vk)
+    base = config["base"]
+    key = config["key"]
     if not key:
         raise RuntimeError("HERMES_API_KEY or API_SERVER_KEY is required")
+    headers = {
+        "authorization": f"Bearer {key}",
+        "content-type": "application/json",
+        "x-hermes-session-key": config["session_key"],
+    }
+    if config.get("profile"):
+        headers["x-hermes-profile"] = config["profile"]
     payload = {
-        "model": env("HERMES_MODEL", "hermes-agent"),
+        "model": config["model"],
         "input": build_hermes_input(vk),
         "instructions": hermes_instructions(vk),
-        "conversation": f"vk:{vk['peer_id']}",
+        "conversation": config["session_key"],
         "store": True,
     }
     res = requests.post(
         f"{base}/v1/responses",
-        headers={
-            "authorization": f"Bearer {key}",
-            "content-type": "application/json",
-            "x-hermes-session-key": f"vk:{vk['peer_id']}",
-        },
+        headers=headers,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         timeout=int_env("HERMES_TIMEOUT_MS", 120000) / 1000,
     )
@@ -1280,6 +1329,18 @@ def run_doctor(
         ))
     else:
         checks.append(doctor_check("VK_ALLOW_ALL_USERS", True, "disabled"))
+    if policy_has_public_hermes_reply():
+        public_separate = hermes_public_is_separate()
+        public_detail = env("HERMES_PUBLIC_PROFILE") or env("HERMES_PUBLIC_API_BASE") or env("HERMES_PUBLIC_MODEL") or env("HERMES_PUBLIC_SESSION_PREFIX") or ("public auth configured" if env("HERMES_PUBLIC_API_KEY") else "public requests would use private profile")
+        checks.append(doctor_check(
+            "PUBLIC_HERMES_PROFILE",
+            public_separate,
+            public_detail,
+            "Set HERMES_PUBLIC_PROFILE and preferably HERMES_PUBLIC_API_KEY/HERMES_PUBLIC_SESSION_PREFIX for public Hermes replies.",
+            status="ok" if public_separate else "warn",
+        ))
+    else:
+        checks.append(doctor_check("PUBLIC_HERMES_PROFILE", True, "not used: public Hermes replies disabled"))
     if emergency_lockdown_enabled():
         checks.append(doctor_check("EMERGENCY_LOCKDOWN", True, "enabled: non-owner traffic is forced to deny"))
     else:

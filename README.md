@@ -103,6 +103,21 @@ For a safe public mode that does not call the private Hermes backend, configure 
 
 The worker searches only configured local sources, returns a short excerpt with `Sources:` citations, and never invents an answer. If no reliable source reaches `VK_PUBLIC_FAQ_MIN_SCORE`, it creates a pending review item when `REVIEW_DB` is configured; optionally set `VK_PUBLIC_FAQ_MISS_REPLY` to tell the user the question was handed off.
 
+## Separate Hermes profile for public replies
+
+If you intentionally allow public/model-backed replies (`action=reply`, `hermes_allowed=true` for `public` or `group_chat`), keep them isolated from the owner/private profile:
+
+```text
+HERMES_PUBLIC_PROFILE=vk-public
+HERMES_PUBLIC_API_KEY=...
+HERMES_PUBLIC_MODEL=...
+HERMES_PUBLIC_SESSION_PREFIX=vk-public
+```
+
+The worker sends public requests with a separate `x-hermes-profile` and `x-hermes-session-key` prefix. Owner/trusted private traffic keeps the normal `HERMES_API_KEY`, `HERMES_MODEL`, and `vk:<peer_id>` session key. `--doctor` warns when public Hermes replies are enabled but no public profile/API/model/session override is configured.
+
+Recommended public profile setup: create a dedicated Hermes profile (for example `hermes profile create vk-public`), disable risky toolsets for that profile, use separate memory, and avoid sharing the owner session key with public traffic.
+
 ## Quick start
 
 1. Copy env template:
