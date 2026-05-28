@@ -635,6 +635,7 @@ def build_vk_outbound_messages(peer_id: str, text: str, *, trace_id: str) -> lis
 def parse_outbound_media_reply(text: str) -> dict[str, Any]:
     message_lines: list[str] = []
     media_paths: list[Path] = []
+    media_urls: list[str] = []
     warnings: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
@@ -642,6 +643,15 @@ def parse_outbound_media_reply(text: str) -> dict[str, Any]:
             message_lines.append(line)
             continue
         raw_path = stripped.removeprefix("MEDIA:").strip()
+        if raw_path.startswith(("http://", "https://")):
+            parsed = urlparse(raw_path)
+            name = Path(parsed.path).name or "media"
+            ext = Path(name).suffix.lower().lstrip(".")
+            if ext not in media_allowed_exts():
+                warnings.append(f"MEDIA not attached: {name} unsupported_ext")
+            else:
+                media_urls.append(raw_path)
+            continue
         path = Path(raw_path).expanduser()
         name = path.name or raw_path
         ext = path.suffix.lower().lstrip(".")
@@ -653,7 +663,24 @@ def parse_outbound_media_reply(text: str) -> dict[str, Any]:
             warnings.append(f"MEDIA not attached: {name} too_large")
         else:
             media_paths.append(path)
-    return {"message": "\n".join(message_lines).strip(), "media_paths": media_paths, "warnings": warnings}
+    return {"message": "\n".join(message_lines).strip(), "media_paths": media_paths, "media_urls": media_urls, "warnings": warnings}
+
+
+def _download_outbound_media_url(url: str) -> Path:
+    parsed = urlparse(url)
+    name = Path(parsed.path).name or "media.bin"
+    ext = Path(name).suffix.lower().lstrip(".")
+    if ext not in media_allowed_exts():
+        raise RuntimeError("unsupported_ext")
+    res = requests.get(url, timeout=60)
+    if not res.ok:
+        raise RuntimeError(f"download_http_{res.status_code}")
+    content = res.content
+    if len(content) > media_max_bytes():
+        raise RuntimeError("too_large")
+    tmp = Path(tempfile.mkdtemp(prefix="vk-media-")) / name
+    tmp.write_bytes(content)
+    return tmp
 
 
 def _vk_method(method: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -733,6 +760,13 @@ def reply_vk(peer_id: str, text: str, *, trace_id: str | None = None) -> None:
     message = media["message"]
     warnings = list(media["warnings"])
     attachments: list[str] = []
+    for url in media.get("media_urls", []):
+        try:
+            media["media_paths"].append(_download_outbound_media_url(url))
+        except Exception as exc:
+            name = Path(urlparse(url).path).name or "media"
+            LOG.warning("VK media download failed trace_id=%s url=%s error=%s", actual_trace_id, redact_secrets(url), redact_secrets(exc))
+            warnings.append(f"MEDIA not attached: {name} download_failed")
     for path in media["media_paths"]:
         try:
             attachments.append(upload_vk_media(peer_id, path))

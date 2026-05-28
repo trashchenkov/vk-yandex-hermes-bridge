@@ -122,7 +122,7 @@ Recommended public profile setup: create a dedicated Hermes profile (for example
 
 For owner/trusted inbound traffic the worker can include safe VK attachment references in the Hermes input. It does not download inbound files itself in this slice; it forwards redacted VK CDN URLs for supported photo/doc attachments and records why unsupported media was skipped.
 
-The worker also supports outbound `MEDIA:/absolute/path` lines in Hermes replies. Supported local image files are uploaded through VK photo upload APIs; other supported files are uploaded as VK documents. The visible text is sent as the message body, while invalid/missing/oversized media degrade to a short `MEDIA not attached: ...` warning instead of failing the whole reply.
+The worker also supports outbound `MEDIA:/absolute/path` and `MEDIA:https://...` lines in Hermes replies. Supported local image files are uploaded through VK photo upload APIs; other supported local files and downloaded URLs are uploaded as VK documents. The visible text is sent as the message body, while invalid/missing/oversized media degrade to a short `MEDIA not attached: ...` warning instead of failing the whole reply.
 
 Controls:
 
@@ -136,7 +136,7 @@ Rules:
 - public/group_chat attachments are never forwarded to Hermes, even when public Hermes replies are enabled;
 - inbound docs and outbound `MEDIA:` files over `VK_MEDIA_MAX_BYTES` or with unsupported extensions degrade to a short `not forwarded` / `not attached` note;
 - attachment access keys in rendered inbound URLs are redacted before entering Hermes input/logs;
-- outbound uploads use runtime local files only; `.env` and state files remain excluded from the Docker build context.
+- outbound uploads use runtime local files or downloaded `https://...` media only; `.env` and state files remain excluded from the Docker build context.
 
 ## Quick start
 
