@@ -31,9 +31,14 @@ VK_MAX_MESSAGE_CHARS = 9000
 
 def load_dotenv(path: str | Path) -> None:
     p = Path(path)
-    if not p.exists():
+    try:
+        if not p.exists():
+            return
+        lines = p.read_text(errors="replace").splitlines()
+    except OSError as exc:
+        LOG.warning("skip dotenv %s: %s", p, exc)
         return
-    for line in p.read_text(errors="replace").splitlines():
+    for line in lines:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
