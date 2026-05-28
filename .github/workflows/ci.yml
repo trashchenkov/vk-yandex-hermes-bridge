@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: yandex-vk-hermes-function/package-lock.json
+
+      - name: Install function dependencies
+        run: npm ci --prefix yandex-vk-hermes-function
+
+      - name: Check cloud function syntax
+        run: node --check yandex-vk-hermes-function/index.js
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install worker dependencies
+        run: python -m pip install -r vm-worker/requirements.txt pytest
+
+      - name: Check worker syntax
+        run: python -m py_compile vm-worker/vk_hermes_worker.py
+
+      - name: Run Python tests
+        run: python -m pytest -q
+
+      - name: Check shell scripts
+        run: |
+          bash -n scripts/setup-hermes-api-server.sh
+          bash -n scripts/install-vk-hermes-worker-service.sh
+          bash -n scripts/build-yandex-function-zip.sh
