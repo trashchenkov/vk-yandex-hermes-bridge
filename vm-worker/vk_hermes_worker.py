@@ -733,8 +733,15 @@ def run_fake_event(
     }
 
 
-def doctor_check(name: str, ok: bool, detail: str) -> dict[str, str]:
-    return {"name": name, "status": "ok" if ok else "fail", "detail": detail}
+def doctor_check(name: str, ok: bool, detail: str, hint: str = "", status: str | None = None) -> dict[str, str]:
+    check = {"name": name, "status": status or ("ok" if ok else "fail"), "detail": detail}
+    if hint:
+        check["hint"] = hint
+    return check
+
+
+def _redacted_configured(value: str) -> str:
+    return "configured ***" if value else "missing"
 
 
 def run_doctor(
@@ -745,35 +752,78 @@ def run_doctor(
     check_network: bool = False,
 ) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
-    checks.append(doctor_check("QUEUE_URL", bool(env("QUEUE_URL")), "configured" if env("QUEUE_URL") else "missing QUEUE_URL"))
-    checks.append(doctor_check("VK_GROUP_TOKEN", bool(env("VK_GROUP_TOKEN")), "configured" if env("VK_GROUP_TOKEN") else "missing VK_GROUP_TOKEN"))
+    checks.append(doctor_check(
+        "QUEUE_URL",
+        bool(env("QUEUE_URL")),
+        "configured" if env("QUEUE_URL") else "missing QUEUE_URL",
+        "Set QUEUE_URL to the Yandex Message Queue URL used by the worker.",
+    ))
+    checks.append(doctor_check(
+        "VK_GROUP_TOKEN",
+        bool(env("VK_GROUP_TOKEN")),
+        _redacted_configured(env("VK_GROUP_TOKEN")),
+        "Set VK_GROUP_TOKEN from VK community settings; never commit it.",
+    ))
     has_owner = bool(owner_vk_users())
-    checks.append(doctor_check("OWNER_ALLOWLIST", has_owner, "configured" if has_owner else "missing VK_OWNER_ID or VK_ALLOWED_USERS"))
+    checks.append(doctor_check(
+        "OWNER_ALLOWLIST",
+        has_owner,
+        "configured" if has_owner else "missing VK_OWNER_ID or VK_ALLOWED_USERS",
+        "Set VK_OWNER_ID to the maintainer VK user id before enabling the bridge.",
+    ))
     has_hermes_key = bool(env("HERMES_API_KEY") or env("API_SERVER_KEY"))
-    checks.append(doctor_check("HERMES_API_KEY", has_hermes_key, "configured" if has_hermes_key else "missing HERMES_API_KEY or API_SERVER_KEY"))
+    checks.append(doctor_check(
+        "HERMES_API_KEY",
+        has_hermes_key,
+        _redacted_configured(env("HERMES_API_KEY") or env("API_SERVER_KEY")),
+        "Set HERMES_API_KEY or API_SERVER_KEY for the local Hermes API server.",
+    ))
+    if truthy_env("VK_ALLOW_ALL_USERS"):
+        allow_all_ok = truthy_env("VK_BRIDGE_TEST_MODE")
+        checks.append(doctor_check(
+            "VK_ALLOW_ALL_USERS",
+            allow_all_ok,
+            "enabled in explicit test mode" if allow_all_ok else "enabled outside explicit test mode",
+            "Disable VK_ALLOW_ALL_USERS for public/semi-public communities; use VK_PUBLIC_HANDOFF instead.",
+        ))
+    else:
+        checks.append(doctor_check("VK_ALLOW_ALL_USERS", True, "disabled"))
     base = env("HERMES_API_BASE", "http://127.0.0.1:8642").rstrip("/")
     if check_network:
         try:
             res = requests.get(f"{base}/health", timeout=3)
-            checks.append(doctor_check("HERMES_API_BASE", res.ok, f"GET /health HTTP {res.status_code}"))
+            checks.append(doctor_check(
+                "HERMES_API_BASE",
+                res.ok,
+                f"GET /health HTTP {res.status_code}",
+                "Start Hermes API server or fix HERMES_API_BASE.",
+            ))
         except Exception as exc:
-            checks.append(doctor_check("HERMES_API_BASE", False, f"unreachable: {exc}"))
+            checks.append(doctor_check(
+                "HERMES_API_BASE",
+                False,
+                f"unreachable: {exc}",
+                "Start Hermes API server and verify HERMES_API_BASE points to it.",
+            ))
     else:
-        checks.append(doctor_check("HERMES_API_BASE", bool(base), base or "missing"))
+        checks.append(doctor_check("HERMES_API_BASE", bool(base), base or "missing", "Set HERMES_API_BASE, default is http://127.0.0.1:8642."))
     try:
         DedupStore(dedup_db)
         TraceStore(trace_db)
         ReviewStore(review_db)
         checks.append(doctor_check("STATE_DBS", True, "dedup/trace/review stores opened"))
     except Exception as exc:
-        checks.append(doctor_check("STATE_DBS", False, str(exc)))
+        checks.append(doctor_check("STATE_DBS", False, str(exc), "Ensure state directory exists and is writable by the worker user."))
     return {"ok": all(check["status"] == "ok" for check in checks), "checks": checks}
 
 
 def format_doctor_report(report: dict[str, Any]) -> str:
     lines = [f"Doctor: {'OK' if report.get('ok') else 'FAIL'}"]
     for check in report.get("checks") or []:
-        lines.append(f"[{check.get('status')}] {check.get('name')}: {check.get('detail')}")
+        line = f"[{check.get('status')}] {check.get('name')}: {check.get('detail')}"
+        if check.get("hint") and check.get("status") in {"fail", "warn"}:
+            line = f"{line} | hint: {check.get('hint')}"
+        lines.append(line)
     return "\n".join(lines)
 
 
