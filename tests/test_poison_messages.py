@@ -41,10 +41,10 @@ class FakeQueueClient:
         self.deleted.append(kwargs["ReceiptHandle"])
 
 
-def vk_event(from_id: int = 1, text: str = "boom") -> dict:
+def vk_event(from_id: int = 1, text: str = "boom", event_id: str = "poison-event") -> dict:
     return {
         "type": "message_new",
-        "event_id": "poison-event",
+        "event_id": event_id,
         "object": {
             "message": {
                 "id": 501,
@@ -110,8 +110,76 @@ def test_run_once_moves_repeated_failure_to_poison_store_and_deletes_queue_messa
 def test_poison_store_roundtrips_recent_records(tmp_path):
     worker = load_worker()
     store = worker.PoisonStore(tmp_path / "poison.sqlite3")
-    store.put({"trace_id": "t1", "message_id": "m1", "receive_count": 5, "error": "bad", "payload": {"ok": True}})
+    stored = store.put({"trace_id": "t1", "message_id": "m1", "receive_count": 5, "error": "bad", "payload": {"ok": True}})
 
     records = store.list_recent(limit=1)
 
-    assert records == [{"trace_id": "t1", "message_id": "m1", "receive_count": 5, "error": "bad", "payload": {"ok": True}}]
+    assert records == [{"id": stored["id"], "trace_id": "t1", "message_id": "m1", "receive_count": 5, "error": "bad", "payload": {"ok": True}}]
+    assert store.get(stored["id"]) == records[0]
+
+
+def test_readme_documents_owner_poison_commands():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "!poison" in readme
+    assert "poison message #1" in readme
+
+
+def test_owner_poison_command_lists_recent_poison_messages(monkeypatch, tmp_path):
+    worker = load_worker()
+    monkeypatch.setenv("VK_OWNER_ID", "1")
+    sent: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(worker, "reply_vk", lambda peer_id, text, **kwargs: sent.append((peer_id, text, kwargs)))
+    poison_store = worker.PoisonStore(tmp_path / "poison.sqlite3")
+    poison_store.put({"trace_id": "vk-deadbeef", "message_id": "m1", "receive_count": 5, "error": "Hermes down", "payload": vk_event(9, "public failed")})
+
+    worker.process_payload(
+        vk_event(1, "!poison", event_id="poison-list-command"),
+        worker.DedupStore(tmp_path / "dedup.sqlite3"),
+        poison_store=poison_store,
+    )
+
+    assert len(sent) == 1
+    assert sent[0][0] == "1"
+    assert "Poison messages:" in sent[0][1]
+    assert "#1" in sent[0][1]
+    assert "vk-deadbeef" in sent[0][1]
+    assert "Hermes down" in sent[0][1]
+
+
+def test_owner_poison_command_returns_detail_by_id(monkeypatch, tmp_path):
+    worker = load_worker()
+    monkeypatch.setenv("VK_OWNER_ID", "1")
+    sent: list[str] = []
+    monkeypatch.setattr(worker, "reply_vk", lambda peer_id, text, **kwargs: sent.append(text))
+    poison_store = worker.PoisonStore(tmp_path / "poison.sqlite3")
+    stored = poison_store.put({"trace_id": "vk-detail", "message_id": "m9", "receive_count": 7, "error": "token=secret", "payload": vk_event(9, "payload text")})
+
+    worker.process_payload(
+        vk_event(1, f"!poison {stored['id']}", event_id="poison-detail-command"),
+        worker.DedupStore(tmp_path / "dedup.sqlite3"),
+        poison_store=poison_store,
+    )
+
+    assert len(sent) == 1
+    assert "Poison #" in sent[0]
+    assert "vk-detail" in sent[0]
+    assert "message_id=m9" in sent[0]
+    assert "receive_count=7" in sent[0]
+    assert "secret" not in sent[0]
+
+
+def test_public_poison_command_is_denied_without_store_access(monkeypatch, tmp_path):
+    worker = load_worker()
+    monkeypatch.setenv("VK_OWNER_ID", "1")
+    monkeypatch.setenv("VK_UNAUTHORIZED_MODE", "ignore")
+    monkeypatch.setattr(worker, "call_hermes", lambda vk: (_ for _ in ()).throw(AssertionError("Hermes must not be called")))
+    sent: list[str] = []
+    monkeypatch.setattr(worker, "reply_vk", lambda peer_id, text, **kwargs: sent.append(text))
+
+    worker.process_payload(
+        vk_event(9, "!poison", event_id="public-poison-command"),
+        worker.DedupStore(tmp_path / "dedup.sqlite3"),
+        poison_store=worker.PoisonStore(tmp_path / "poison.sqlite3"),
+    )
+
+    assert sent == []

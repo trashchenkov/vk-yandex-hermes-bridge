@@ -274,6 +274,13 @@ POISON_DB=./state/vk-worker-poison.sqlite3
 VK_POISON_MAX_RECEIVE_COUNT=5
 ```
 
+Owner-only poison inspection commands are available when the poison store is wired into the worker:
+
+```text
+!poison      # list recent poison messages
+!poison 1    # show redacted detail for poison message #1
+```
+
 Public/group traffic is rate-limited before it can grow the review queue or reach public FAQ/Hermes handling. Owner/trusted private traffic is not rate-limited by this guard:
 
 ```text

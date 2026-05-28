@@ -198,7 +198,7 @@ def resolve_role(vk: dict[str, Any]) -> str:
     return "public"
 
 
-OWNER_COMMANDS = {"trace", "pending", "approve", "reject", "reply"}
+OWNER_COMMANDS = {"trace", "pending", "approve", "reject", "reply", "poison"}
 
 
 def parse_owner_command(text: str) -> dict[str, Any] | None:
@@ -901,6 +901,7 @@ class PoisonStore:
     def put(self, record: dict[str, Any]) -> dict[str, Any]:
         payload = redact_for_logs(dict(record))
         payload.setdefault("created_at", time.time())
+        record_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         cur = self.db.execute(
             "INSERT INTO poison_messages (created_at, trace_id, message_id, receive_count, record_json) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -909,22 +910,31 @@ class PoisonStore:
                 str(payload.get("trace_id") or ""),
                 str(payload.get("message_id") or ""),
                 int(payload.get("receive_count") or 0),
-                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                record_json,
             ),
         )
         self.db.commit()
         payload["id"] = int(cur.lastrowid)
         return payload
 
+    def _row_to_record(self, row: tuple[Any, ...] | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        record = json.loads(row[1])
+        record["id"] = int(row[0])
+        record.pop("created_at", None)
+        return record
+
+    def get(self, item_id: int | str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT id, record_json FROM poison_messages WHERE id = ?", (int(item_id),)).fetchone()
+        return self._row_to_record(row)
+
     def list_recent(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.db.execute(
-            "SELECT record_json FROM poison_messages ORDER BY created_at DESC, id DESC LIMIT ?",
+            "SELECT id, record_json FROM poison_messages ORDER BY created_at DESC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        records = [json.loads(row[0]) for row in rows]
-        for record in records:
-            record.pop("created_at", None)
-        return records
+        return [record for row in rows if (record := self._row_to_record(row)) is not None]
 
 
 class ReviewStore:
@@ -1153,11 +1163,40 @@ def format_pending_items(items: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_poison_messages(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "No poison messages."
+    lines = ["Poison messages:"]
+    for item in items:
+        error = str(item.get("error") or "").replace("\n", " ")[:100]
+        lines.append(
+            f"#{item.get('id')} trace={item.get('trace_id', '')} "
+            f"message_id={item.get('message_id', '')} receives={item.get('receive_count', '')} error={error}"
+        )
+    return "\n".join(lines)
+
+
+def format_poison_detail(item: dict[str, Any]) -> str:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    vk = normalize_vk_message(payload) if payload else {"peer_id": "", "from_id": "", "text": ""}
+    text = redact_notification_text(str(vk.get("text") or "").replace("\n", " "))[:240]
+    return "\n".join([
+        f"Poison #{item.get('id')}",
+        f"trace={item.get('trace_id', '')}",
+        f"message_id={item.get('message_id', '')}",
+        f"receive_count={item.get('receive_count', '')}",
+        f"from={vk.get('from_id', '')} peer={vk.get('peer_id', '')}",
+        f"error={item.get('error', '')}",
+        f"text={text}",
+    ])
+
+
 def handle_owner_command(
     vk: dict[str, Any],
     decision: dict[str, Any],
     trace_store: TraceStore | None,
     review_store: ReviewStore | None = None,
+    poison_store: PoisonStore | None = None,
 ) -> str:
     command = str(decision.get("command") or "unknown")
     args = [str(arg) for arg in decision.get("command_args") or []]
@@ -1174,6 +1213,18 @@ def handle_owner_command(
         if not review_store:
             return "Review store is not configured."
         return format_pending_items(review_store.list_pending())
+    if command == "poison":
+        if not poison_store:
+            return "Poison store is not configured."
+        if not args:
+            return format_poison_messages(poison_store.list_recent())
+        try:
+            item = poison_store.get(args[0])
+        except ValueError:
+            item = None
+        if not item:
+            return f"Poison message #{args[0]} not found."
+        return format_poison_detail(item)
     if command in {"approve", "reject"}:
         if not args:
             return f"Usage: !{command} <review_id>"
@@ -1209,6 +1260,7 @@ def process_payload(
     trace_store: TraceStore | None = None,
     review_store: ReviewStore | None = None,
     rate_store: RateLimitStore | None = None,
+    poison_store: PoisonStore | None = None,
 ) -> None:
     vk = normalize_vk_message(payload)
     trace_id = trace_id_for_payload(payload)
@@ -1296,7 +1348,7 @@ def process_payload(
             return
 
         if action == "owner_command":
-            reply_vk(vk["peer_id"], handle_owner_command(vk, decision, trace_store, review_store=review_store), trace_id=trace_id)
+            reply_vk(vk["peer_id"], handle_owner_command(vk, decision, trace_store, review_store=review_store, poison_store=poison_store), trace_id=trace_id)
             trace_record["vk_status"] = "sent"
             save_trace(trace_store, trace_record)
             dedup.mark(key)
@@ -1831,6 +1883,7 @@ def run_long_poll_once(
     trace_store: TraceStore | None = None,
     review_store: ReviewStore | None = None,
     rate_store: RateLimitStore | None = None,
+    poison_store: PoisonStore | None = None,
 ) -> dict[str, Any]:
     current = dict(state or {})
     if not current.get("key") or not current.get("server") or not current.get("ts"):
@@ -1858,10 +1911,12 @@ def run_long_poll_once(
         payload = vk_long_poll_update_payload(update)
         if not payload:
             continue
+        kwargs: dict[str, Any] = {"trace_store": trace_store, "review_store": review_store}
         if rate_store:
-            process_payload(payload, dedup, trace_store=trace_store, review_store=review_store, rate_store=rate_store)
-        else:
-            process_payload(payload, dedup, trace_store=trace_store, review_store=review_store)
+            kwargs["rate_store"] = rate_store
+        if poison_store:
+            kwargs["poison_store"] = poison_store
+        process_payload(payload, dedup, **kwargs)
         processed += 1
     current["processed"] = processed
     current["refresh"] = False
@@ -1873,6 +1928,7 @@ def run_long_poll_loop(
     dedup_path: str | Path,
     trace_path: str | Path,
     review_path: str | Path,
+    poison_path: str | Path,
     rate_path: str | Path,
     once: bool = False,
     session: Any | None = None,
@@ -1880,12 +1936,13 @@ def run_long_poll_loop(
     dedup = DedupStore(dedup_path)
     trace_store = TraceStore(trace_path)
     review_store = ReviewStore(review_path)
+    poison_store = PoisonStore(poison_path)
     rate_store = RateLimitStore(rate_path)
     session = session or requests.Session()
     state: dict[str, Any] | None = None
     cycles = 0
     while True:
-        state = run_long_poll_once(session, dedup, state=state, trace_store=trace_store, review_store=review_store, rate_store=rate_store)
+        state = run_long_poll_once(session, dedup, state=state, trace_store=trace_store, review_store=review_store, rate_store=rate_store, poison_store=poison_store)
         cycles += 1
         LOG.info("long poll cycle processed=%s ts=%s refresh=%s", state.get("processed"), state.get("ts"), state.get("refresh"))
         if once:
@@ -1948,9 +2005,9 @@ def run_once(
             continue
         try:
             if rate_store:
-                process_payload(payload, dedup, trace_store=trace_store, review_store=review_store, rate_store=rate_store)
+                process_payload(payload, dedup, trace_store=trace_store, review_store=review_store, rate_store=rate_store, poison_store=poison_store)
             else:
-                process_payload(payload, dedup, trace_store=trace_store, review_store=review_store)
+                process_payload(payload, dedup, trace_store=trace_store, review_store=review_store, poison_store=poison_store)
         except Exception as exc:
             receive_count = _message_receive_count(msg)
             if poison_store and receive_count >= _poison_threshold():
@@ -2058,6 +2115,7 @@ def main() -> int:
             dedup_path=args.dedup_db or env("DEDUP_DB", default_dedup),
             trace_path=args.trace_db or env("TRACE_DB", default_trace),
             review_path=args.review_db or env("REVIEW_DB", default_review),
+            poison_path=args.poison_db or env("POISON_DB", default_poison),
             rate_path=args.rate_db or env("RATE_LIMIT_DB", default_rate),
             once=args.once,
         ) and 0
