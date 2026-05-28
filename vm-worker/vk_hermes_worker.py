@@ -215,21 +215,6 @@ def redact_for_logs(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_for_logs(item) for item in value]
     return value
-
-
-class JsonLogFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        event: dict[str, Any] = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": redact_notification_text(record.getMessage()),
-        }
-        if record.exc_info:
-            event["exc_info"] = redact_notification_text(self.formatException(record.exc_info))
-        return json.dumps(redact_for_logs(event), ensure_ascii=False, separators=(",", ":"))
-
-
 def configure_logging() -> None:
     level = getattr(logging, env("LOG_LEVEL", "INFO").upper(), logging.INFO)
     if env("LOG_FORMAT").strip().lower() == "json":
