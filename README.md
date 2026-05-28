@@ -179,6 +179,8 @@ bash -n scripts/build-yandex-function-zip.sh
 
 See `docs/MVP.md` for the current MVP scope and `docs/mvp-issues.md` for implementation-ready issue drafts.
 
+Before enabling any public/community behavior, use `docs/public-launch-checklist.md`.
+
 See `ROADMAP.md` for the broader roadmap: doctor/security checks, CI, replay tooling, shadow mode, VK Long Poll mode, policy engine, public FAQ/RAG mode, owner approvals, and native Hermes platform-plugin direction.
 
 ## Operational notes
