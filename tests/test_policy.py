@@ -82,6 +82,38 @@ def test_policy_decision_defaults_public_and_blocked_to_no_hermes(monkeypatch):
     assert public["role"] == "public"
     assert public["action"] == "deny"
     assert public["hermes_allowed"] is False
+    assert public["reason"] == "public_default_deny"
     assert blocked["role"] == "blocked"
     assert blocked["action"] == "deny"
     assert blocked["hermes_allowed"] is False
+
+
+def test_public_handoff_is_explicit_policy_without_hermes(monkeypatch):
+    worker = load_worker()
+    monkeypatch.setenv("VK_OWNER_ID", "1")
+    monkeypatch.setenv("VK_PUBLIC_HANDOFF", "true")
+
+    decision = worker.decide_policy(worker.normalize_vk_message(vk_event(4, "important public question")))
+
+    assert decision == {
+        "role": "public",
+        "action": "handoff",
+        "hermes_allowed": False,
+        "reason": "public_handoff",
+    }
+
+
+def test_fake_event_exposes_full_policy_decision(monkeypatch, tmp_path):
+    worker = load_worker()
+    monkeypatch.setenv("VK_OWNER_ID", "254662087")
+    monkeypatch.delenv("VK_PUBLIC_HANDOFF", raising=False)
+    fixture = ROOT / "fixtures" / "vk" / "message_new_owner.json"
+
+    result = worker.run_fake_event(fixture, fake_hermes_answer="answer", dedup_path=tmp_path / "dedup.sqlite3")
+
+    assert result["policy"] == {
+        "role": "owner",
+        "action": "reply",
+        "hermes_allowed": True,
+        "reason": "allowed_user",
+    }
