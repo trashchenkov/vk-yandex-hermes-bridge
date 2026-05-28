@@ -75,7 +75,11 @@ def test_long_poll_once_fetches_server_and_uses_processing_pipeline(monkeypatch,
     monkeypatch.setenv("VK_GROUP_ID", "123")
     monkeypatch.setenv("VK_GROUP_TOKEN", "token")
     processed = []
-    monkeypatch.setattr(worker, "process_payload", lambda payload, dedup, trace_store=None, review_store=None: processed.append(payload))
+
+    def fake_process_payload(payload, dedup, **kwargs):
+        processed.append(payload)
+
+    monkeypatch.setattr(worker, "process_payload", fake_process_payload)
 
     state = worker.run_long_poll_once(
         FakeSession(),
