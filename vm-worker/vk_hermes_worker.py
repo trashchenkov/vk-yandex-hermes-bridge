@@ -733,6 +733,50 @@ def run_fake_event(
     }
 
 
+def doctor_check(name: str, ok: bool, detail: str) -> dict[str, str]:
+    return {"name": name, "status": "ok" if ok else "fail", "detail": detail}
+
+
+def run_doctor(
+    *,
+    dedup_db: str | Path,
+    trace_db: str | Path,
+    review_db: str | Path,
+    check_network: bool = False,
+) -> dict[str, Any]:
+    checks: list[dict[str, str]] = []
+    checks.append(doctor_check("QUEUE_URL", bool(env("QUEUE_URL")), "configured" if env("QUEUE_URL") else "missing QUEUE_URL"))
+    checks.append(doctor_check("VK_GROUP_TOKEN", bool(env("VK_GROUP_TOKEN")), "configured" if env("VK_GROUP_TOKEN") else "missing VK_GROUP_TOKEN"))
+    has_owner = bool(owner_vk_users())
+    checks.append(doctor_check("OWNER_ALLOWLIST", has_owner, "configured" if has_owner else "missing VK_OWNER_ID or VK_ALLOWED_USERS"))
+    has_hermes_key = bool(env("HERMES_API_KEY") or env("API_SERVER_KEY"))
+    checks.append(doctor_check("HERMES_API_KEY", has_hermes_key, "configured" if has_hermes_key else "missing HERMES_API_KEY or API_SERVER_KEY"))
+    base = env("HERMES_API_BASE", "http://127.0.0.1:8642").rstrip("/")
+    if check_network:
+        try:
+            res = requests.get(f"{base}/health", timeout=3)
+            checks.append(doctor_check("HERMES_API_BASE", res.ok, f"GET /health HTTP {res.status_code}"))
+        except Exception as exc:
+            checks.append(doctor_check("HERMES_API_BASE", False, f"unreachable: {exc}"))
+    else:
+        checks.append(doctor_check("HERMES_API_BASE", bool(base), base or "missing"))
+    try:
+        DedupStore(dedup_db)
+        TraceStore(trace_db)
+        ReviewStore(review_db)
+        checks.append(doctor_check("STATE_DBS", True, "dedup/trace/review stores opened"))
+    except Exception as exc:
+        checks.append(doctor_check("STATE_DBS", False, str(exc)))
+    return {"ok": all(check["status"] == "ok" for check in checks), "checks": checks}
+
+
+def format_doctor_report(report: dict[str, Any]) -> str:
+    lines = [f"Doctor: {'OK' if report.get('ok') else 'FAIL'}"]
+    for check in report.get("checks") or []:
+        lines.append(f"[{check.get('status')}] {check.get('name')}: {check.get('detail')}")
+    return "\n".join(lines)
+
+
 def sqs_client():
     return boto3.client(
         "sqs",
@@ -789,6 +833,8 @@ def main() -> int:
     parser.add_argument("--review-db", help="SQLite review inbox path")
     parser.add_argument("--fake-event", help="process a saved VK event fixture without VK/Yandex/Hermes secrets")
     parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event")
+    parser.add_argument("--doctor", action="store_true", help="check required config and local state stores")
+    parser.add_argument("--doctor-network", action="store_true", help="also check Hermes API /health")
     args = parser.parse_args()
 
     load_dotenv(args.hermes_env)
@@ -807,6 +853,16 @@ def main() -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+
+    if args.doctor:
+        report = run_doctor(
+            dedup_db=args.dedup_db or env("DEDUP_DB", default_dedup),
+            trace_db=args.trace_db or env("TRACE_DB", default_trace),
+            review_db=args.review_db or env("REVIEW_DB", default_review),
+            check_network=args.doctor_network,
+        )
+        print(format_doctor_report(report))
+        return 0 if report["ok"] else 2
 
     queue_url = env("QUEUE_URL")
     if not queue_url:
