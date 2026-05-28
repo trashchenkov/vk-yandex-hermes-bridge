@@ -20,6 +20,7 @@ def test_ci_workflow_exists_and_runs_required_checks():
         "bash -n scripts/install-vk-hermes-worker-service.sh",
         "bash -n scripts/build-yandex-function-zip.sh",
         "bash -n scripts/deploy-yandex-function.sh",
+        "cp .env.example .env",
         "docker compose config",
     ]
     for phrase in required:

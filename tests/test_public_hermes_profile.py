@@ -73,6 +73,8 @@ def test_public_hermes_reply_uses_public_profile_session_and_key(monkeypatch):
 
 def test_owner_hermes_reply_keeps_private_profile(monkeypatch):
     worker = load_worker()
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PREFIX", raising=False)
     monkeypatch.setenv("VK_OWNER_ID", "1")
     monkeypatch.setenv("HERMES_API_KEY", "private-key")
     monkeypatch.setenv("HERMES_MODEL", "private-model")
