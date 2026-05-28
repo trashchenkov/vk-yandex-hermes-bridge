@@ -339,7 +339,13 @@ VK_ALLOWED_USERS=254662087 python3 vm-worker/vk_hermes_worker.py \
 
 ## Verification
 
-Run local checks before publishing/deploying:
+Run all local checks before publishing/deploying:
+
+```bash
+make check
+```
+
+This runs the worker syntax check, Python test suite, cloud-function Node syntax check, shell syntax checks, and `docker compose config` when Docker Compose is available. The raw commands are also available if you need to run one gate directly:
 
 ```bash
 node --check yandex-vk-hermes-function/index.js
