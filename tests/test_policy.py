@@ -57,6 +57,8 @@ def test_policy_decision_routes_owner_command_only_for_owner(monkeypatch):
         "action": "owner_command",
         "hermes_allowed": False,
         "reason": "owner_command",
+        "command": "trace",
+        "command_args": ["vk-1"],
     }
     assert public_decision["role"] == "public"
     assert public_decision["action"] == "deny"

@@ -110,19 +110,36 @@ def resolve_role(vk: dict[str, Any]) -> str:
     return "public"
 
 
+OWNER_COMMANDS = {"trace", "pending", "approve", "reject"}
+
+
+def parse_owner_command(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if not stripped.startswith("!"):
+        return None
+    parts = stripped[1:].split()
+    if not parts:
+        return None
+    command = parts[0].lower()
+    if command not in OWNER_COMMANDS:
+        return None
+    return {"command": command, "command_args": parts[1:]}
+
+
 def is_owner_command(text: str) -> bool:
-    return text.strip().startswith("!")
+    return parse_owner_command(text) is not None
 
 
 def decide_policy(vk: dict[str, Any]) -> dict[str, Any]:
     role = resolve_role(vk)
     text = str(vk.get("text") or "")
+    command = parse_owner_command(text)
     if role == "blocked":
         return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "blocked_user"}
-    if is_owner_command(text):
+    if command:
         if role == "owner":
-            return {"role": role, "action": "owner_command", "hermes_allowed": False, "reason": "owner_command"}
-        return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "owner_command_requires_owner"}
+            return {"role": role, "action": "owner_command", "hermes_allowed": False, "reason": "owner_command", **command}
+        return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "owner_command_requires_owner", **command}
     if role in {"owner", "trusted"}:
         return {"role": role, "action": "reply", "hermes_allowed": True, "reason": "allowed_user"}
     if truthy_env("VK_PUBLIC_HANDOFF"):
@@ -423,7 +440,8 @@ def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
         return
 
     if action == "owner_command":
-        reply_vk(vk["peer_id"], "Owner command accepted, but this command is not implemented yet.", trace_id=trace_id)
+        command = decision.get("command", "unknown")
+        reply_vk(vk["peer_id"], f"Owner command !{command} accepted, but it is not implemented yet.", trace_id=trace_id)
         dedup.mark(key)
         return
 
