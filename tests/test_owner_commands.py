@@ -81,4 +81,4 @@ def test_owner_command_is_acknowledged_without_calling_hermes(monkeypatch, tmp_p
     worker.process_payload(payload, worker.DedupStore(tmp_path / "dedup.sqlite3"))
 
     assert hermes_calls == []
-    assert sent == [("1", "Owner command !pending accepted, but it is not implemented yet.", {"trace_id": worker.trace_id_for_payload(payload)})]
+    assert sent == [("1", "Review store is not configured.", {"trace_id": worker.trace_id_for_payload(payload)})]

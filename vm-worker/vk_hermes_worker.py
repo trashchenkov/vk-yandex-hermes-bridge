@@ -381,6 +381,82 @@ class TraceStore:
         return json.loads(row[0])
 
 
+class ReviewStore:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if str(path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path))
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS review_items ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL, updated_at REAL NOT NULL, "
+            "status TEXT NOT NULL, kind TEXT NOT NULL, trace_id TEXT NOT NULL, peer_id TEXT NOT NULL, "
+            "from_id TEXT NOT NULL, text TEXT NOT NULL, item_json TEXT NOT NULL)"
+        )
+        self.db.commit()
+
+    def create_item(
+        self,
+        *,
+        kind: str,
+        trace_id: str,
+        peer_id: str,
+        from_id: str,
+        text: str,
+        status: str = "pending",
+    ) -> dict[str, Any]:
+        now = time.time()
+        item = {
+            "id": 0,
+            "created_at": now,
+            "updated_at": now,
+            "status": status,
+            "kind": kind,
+            "trace_id": trace_id,
+            "peer_id": str(peer_id),
+            "from_id": str(from_id),
+            "text": text,
+        }
+        cur = self.db.execute(
+            "INSERT INTO review_items (created_at, updated_at, status, kind, trace_id, peer_id, from_id, text, item_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now, now, status, kind, trace_id, str(peer_id), str(from_id), text, "{}"),
+        )
+        item["id"] = int(cur.lastrowid)
+        self.db.execute("UPDATE review_items SET item_json = ? WHERE id = ?", (json.dumps(item, ensure_ascii=False, sort_keys=True), item["id"]))
+        self.db.commit()
+        return item
+
+    def _row_to_item(self, row: sqlite3.Row | tuple[Any, ...] | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        return json.loads(row[-1])
+
+    def get(self, item_id: int | str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT item_json FROM review_items WHERE id = ?", (int(item_id),)).fetchone()
+        return self._row_to_item(row)
+
+    def list_pending(self, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT item_json FROM review_items WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def update_status(self, item_id: int | str, status: str) -> dict[str, Any]:
+        item = self.get(item_id)
+        if not item:
+            raise KeyError(f"review item #{item_id} not found")
+        item["status"] = status
+        item["updated_at"] = time.time()
+        self.db.execute(
+            "UPDATE review_items SET status = ?, updated_at = ?, item_json = ? WHERE id = ?",
+            (status, item["updated_at"], json.dumps(item, ensure_ascii=False, sort_keys=True), int(item_id)),
+        )
+        self.db.commit()
+        return item
+
+
 def role_for_vk(vk: dict[str, Any]) -> str:
     return resolve_role(vk)
 
@@ -460,7 +536,22 @@ def format_trace_record(record: dict[str, Any]) -> str:
     ])
 
 
-def handle_owner_command(vk: dict[str, Any], decision: dict[str, Any], trace_store: TraceStore | None) -> str:
+def format_pending_items(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "No pending review items."
+    lines = ["Pending review items:"]
+    for item in items:
+        text = str(item.get("text") or "").replace("\n", " ")[:80]
+        lines.append(f"#{item['id']} {item.get('kind', '')} trace={item.get('trace_id', '')} from={item.get('from_id', '')}: {text}")
+    return "\n".join(lines)
+
+
+def handle_owner_command(
+    vk: dict[str, Any],
+    decision: dict[str, Any],
+    trace_store: TraceStore | None,
+    review_store: ReviewStore | None = None,
+) -> str:
     command = str(decision.get("command") or "unknown")
     args = [str(arg) for arg in decision.get("command_args") or []]
     if command == "trace":
@@ -472,10 +563,29 @@ def handle_owner_command(vk: dict[str, Any], decision: dict[str, Any], trace_sto
         if not record:
             return f"Trace {args[0]} not found."
         return format_trace_record(record)
+    if command == "pending":
+        if not review_store:
+            return "Review store is not configured."
+        return format_pending_items(review_store.list_pending())
+    if command in {"approve", "reject"}:
+        if not args:
+            return f"Usage: !{command} <review_id>"
+        if not review_store:
+            return "Review store is not configured."
+        try:
+            item = review_store.update_status(args[0], "approved" if command == "approve" else "rejected")
+        except (KeyError, ValueError):
+            return f"Review item #{args[0]} not found."
+        return f"Review item #{item['id']} {item['status']}."
     return f"Owner command !{command} accepted, but it is not implemented yet."
 
 
-def process_payload(payload: dict[str, Any], dedup: DedupStore, trace_store: TraceStore | None = None) -> None:
+def process_payload(
+    payload: dict[str, Any],
+    dedup: DedupStore,
+    trace_store: TraceStore | None = None,
+    review_store: ReviewStore | None = None,
+) -> None:
     vk = normalize_vk_message(payload)
     trace_id = trace_id_for_payload(payload)
     if not vk["peer_id"]:
@@ -509,6 +619,14 @@ def process_payload(payload: dict[str, Any], dedup: DedupStore, trace_store: Tra
 
     try:
         if action in {"deny", "handoff"}:
+            if action == "handoff" and review_store:
+                review_store.create_item(
+                    kind="public_question",
+                    trace_id=trace_id,
+                    peer_id=vk["peer_id"],
+                    from_id=vk["from_id"],
+                    text=vk["text"],
+                )
             reply = unauthorized_reply_text()
             if reply:
                 reply_vk(vk["peer_id"], reply, trace_id=trace_id)
@@ -518,7 +636,7 @@ def process_payload(payload: dict[str, Any], dedup: DedupStore, trace_store: Tra
             return
 
         if action == "owner_command":
-            reply_vk(vk["peer_id"], handle_owner_command(vk, decision, trace_store), trace_id=trace_id)
+            reply_vk(vk["peer_id"], handle_owner_command(vk, decision, trace_store, review_store=review_store), trace_id=trace_id)
             trace_record["vk_status"] = "sent"
             save_trace(trace_store, trace_record)
             dedup.mark(key)
@@ -608,7 +726,13 @@ def sqs_client():
     )
 
 
-def run_once(client: Any, queue_url: str, dedup: DedupStore, trace_store: TraceStore | None = None) -> int:
+def run_once(
+    client: Any,
+    queue_url: str,
+    dedup: DedupStore,
+    trace_store: TraceStore | None = None,
+    review_store: ReviewStore | None = None,
+) -> int:
     res = client.receive_message(
         QueueUrl=queue_url,
         MaxNumberOfMessages=int_env("QUEUE_MAX_MESSAGES", 1),
@@ -625,7 +749,7 @@ def run_once(client: Any, queue_url: str, dedup: DedupStore, trace_store: TraceS
             client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
             continue
         try:
-            process_payload(payload, dedup, trace_store=trace_store)
+            process_payload(payload, dedup, trace_store=trace_store, review_store=review_store)
         except Exception:
             LOG.exception("processing failed; leaving message for retry")
             continue
@@ -638,6 +762,7 @@ def main() -> int:
     default_state = Path(__file__).resolve().parents[1] / "state"
     default_dedup = str(default_state / "vk-worker-dedup.sqlite3")
     default_trace = str(default_state / "vk-worker-trace.sqlite3")
+    default_review = str(default_state / "vk-worker-review.sqlite3")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default=default_env, help="bridge .env path")
@@ -645,6 +770,7 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="process one poll cycle and exit")
     parser.add_argument("--dedup-db", help="SQLite dedup store path")
     parser.add_argument("--trace-db", help="SQLite trace store path")
+    parser.add_argument("--review-db", help="SQLite review inbox path")
     parser.add_argument("--fake-event", help="process a saved VK event fixture without VK/Yandex/Hermes secrets")
     parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event")
     args = parser.parse_args()
@@ -672,11 +798,12 @@ def main() -> int:
 
     dedup = DedupStore(args.dedup_db or env("DEDUP_DB", default_dedup))
     trace_store = TraceStore(args.trace_db or env("TRACE_DB", default_trace))
+    review_store = ReviewStore(args.review_db or env("REVIEW_DB", default_review))
     dedup.cleanup()
     client = sqs_client()
 
     while True:
-        run_once(client, queue_url, dedup, trace_store=trace_store)
+        run_once(client, queue_url, dedup, trace_store=trace_store, review_store=review_store)
         if args.once:
             return 0
 
