@@ -27,7 +27,7 @@ Do not use `VK_ALLOW_ALL_USERS=true` outside explicit local smoke/test mode.
 - `VK_ALLOWED_USERS` is empty or intentionally used only as the legacy owner allowlist fallback.
 - `VK_TRUSTED_USERS` contains only users who may reach Hermes.
 - `VK_BLOCKED_USERS` is ready for emergency user-level deny.
-- Owner-only commands work only for owner: `!trace`, `!pending`, `!approve`, `!reject`, `!reply`.
+- Owner-only commands work only for owner: `!trace`, `!pending`, `!poison`, `!approve`, `!reject`, `!reply`.
 
 ### 2. Policy safety
 
