@@ -844,6 +844,49 @@ class TraceStore:
         return json.loads(row[0])
 
 
+class PoisonStore:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if str(path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path))
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS poison_messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL, "
+            "trace_id TEXT NOT NULL, message_id TEXT NOT NULL, receive_count INTEGER NOT NULL, "
+            "record_json TEXT NOT NULL)"
+        )
+        self.db.commit()
+
+    def put(self, record: dict[str, Any]) -> dict[str, Any]:
+        payload = redact_for_logs(dict(record))
+        payload.setdefault("created_at", time.time())
+        cur = self.db.execute(
+            "INSERT INTO poison_messages (created_at, trace_id, message_id, receive_count, record_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                float(payload["created_at"]),
+                str(payload.get("trace_id") or ""),
+                str(payload.get("message_id") or ""),
+                int(payload.get("receive_count") or 0),
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        self.db.commit()
+        payload["id"] = int(cur.lastrowid)
+        return payload
+
+    def list_recent(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT record_json FROM poison_messages ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        records = [json.loads(row[0]) for row in rows]
+        for record in records:
+            record.pop("created_at", None)
+        return records
+
+
 class ReviewStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -1493,6 +1536,7 @@ def run_doctor(
     dedup_db: str | Path,
     trace_db: str | Path,
     review_db: str | Path,
+    poison_db: str | Path | None = None,
     check_network: bool = False,
 ) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
@@ -1571,7 +1615,10 @@ def run_doctor(
         DedupStore(dedup_db)
         TraceStore(trace_db)
         ReviewStore(review_db)
-        checks.append(doctor_check("STATE_DBS", True, "dedup/trace/review stores opened"))
+        if poison_db is not None:
+            PoisonStore(poison_db)
+        state_detail = "dedup/trace/review/poison stores opened" if poison_db is not None else "dedup/trace/review stores opened"
+        checks.append(doctor_check("STATE_DBS", True, state_detail))
     except Exception as exc:
         checks.append(doctor_check("STATE_DBS", False, str(exc), "Ensure state directory exists and is writable by the worker user."))
     return {"ok": all(check["status"] == "ok" for check in checks), "checks": checks}
@@ -1600,6 +1647,7 @@ def run_health(
     dedup_db: str | Path,
     trace_db: str | Path,
     review_db: str | Path,
+    poison_db: str | Path | None = None,
     check_network: bool = False,
 ) -> dict[str, Any]:
     components: list[dict[str, Any]] = []
@@ -1642,7 +1690,10 @@ def run_health(
         DedupStore(dedup_db)
         TraceStore(trace_db)
         ReviewStore(review_db)
-        components.append(health_component("state_dbs", "ok", "dedup/trace/review stores opened"))
+        if poison_db is not None:
+            PoisonStore(poison_db)
+        state_detail = "dedup/trace/review/poison stores opened" if poison_db is not None else "dedup/trace/review stores opened"
+        components.append(health_component("state_dbs", "ok", state_detail))
     except Exception as exc:
         components.append(health_component("state_dbs", "fail", str(exc)))
 
@@ -1775,18 +1826,49 @@ def run_long_poll_loop(
             return cycles
 
 
+def _message_receive_count(msg: dict[str, Any]) -> int:
+    attrs = msg.get("Attributes") if isinstance(msg.get("Attributes"), dict) else {}
+    try:
+        return int(attrs.get("ApproximateReceiveCount") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _poison_threshold() -> int:
+    return max(1, int_env("VK_POISON_MAX_RECEIVE_COUNT", 5))
+
+
+def _store_poison_message(
+    poison_store: PoisonStore,
+    *,
+    msg: dict[str, Any],
+    payload: dict[str, Any],
+    error: BaseException,
+    receive_count: int,
+) -> None:
+    poison_store.put({
+        "trace_id": trace_id_for_payload(payload),
+        "message_id": str(msg.get("MessageId") or ""),
+        "receive_count": receive_count,
+        "error": redact_secrets(error),
+        "payload": payload,
+    })
+
+
 def run_once(
     client: Any,
     queue_url: str,
     dedup: DedupStore,
     trace_store: TraceStore | None = None,
     review_store: ReviewStore | None = None,
+    poison_store: PoisonStore | None = None,
 ) -> int:
     res = client.receive_message(
         QueueUrl=queue_url,
         MaxNumberOfMessages=int_env("QUEUE_MAX_MESSAGES", 1),
         WaitTimeSeconds=int_env("QUEUE_WAIT_TIME_SECONDS", 20),
         VisibilityTimeout=int_env("QUEUE_VISIBILITY_TIMEOUT", 300),
+        AttributeNames=["ApproximateReceiveCount"],
     )
     messages = res.get("Messages") or []
     for msg in messages:
@@ -1799,7 +1881,13 @@ def run_once(
             continue
         try:
             process_payload(payload, dedup, trace_store=trace_store, review_store=review_store)
-        except Exception:
+        except Exception as exc:
+            receive_count = _message_receive_count(msg)
+            if poison_store and receive_count >= _poison_threshold():
+                _store_poison_message(poison_store, msg=msg, payload=payload, error=exc, receive_count=receive_count)
+                client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+                LOG.exception("processing failed; moved message to poison store after %s receives", receive_count)
+                continue
             LOG.exception("processing failed; leaving message for retry")
             continue
         client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
@@ -1812,6 +1900,7 @@ def main() -> int:
     default_dedup = str(default_state / "vk-worker-dedup.sqlite3")
     default_trace = str(default_state / "vk-worker-trace.sqlite3")
     default_review = str(default_state / "vk-worker-review.sqlite3")
+    default_poison = str(default_state / "vk-worker-poison.sqlite3")
     default_fixture_dir = str(Path(__file__).resolve().parents[1] / "fixtures" / "vk")
 
     parser = argparse.ArgumentParser()
@@ -1822,6 +1911,7 @@ def main() -> int:
     parser.add_argument("--dedup-db", help="SQLite dedup store path")
     parser.add_argument("--trace-db", help="SQLite trace store path")
     parser.add_argument("--review-db", help="SQLite review inbox path")
+    parser.add_argument("--poison-db", help="SQLite poison-message/dead-letter path")
     parser.add_argument("--fake-event", help="process a saved VK event fixture without VK/Yandex/Hermes secrets")
     parser.add_argument("--replay", nargs="+", help="replay one or more saved VK event fixtures with fake Hermes/VK sends")
     parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event/--replay")
@@ -1862,6 +1952,7 @@ def main() -> int:
             dedup_db=args.dedup_db or env("DEDUP_DB", default_dedup),
             trace_db=args.trace_db or env("TRACE_DB", default_trace),
             review_db=args.review_db or env("REVIEW_DB", default_review),
+            poison_db=args.poison_db or env("POISON_DB", default_poison),
             check_network=args.doctor_network,
         )
         print(format_doctor_report(report))
@@ -1873,6 +1964,7 @@ def main() -> int:
             dedup_db=args.dedup_db or env("DEDUP_DB", default_dedup),
             trace_db=args.trace_db or env("TRACE_DB", default_trace),
             review_db=args.review_db or env("REVIEW_DB", default_review),
+            poison_db=args.poison_db or env("POISON_DB", default_poison),
             check_network=args.health_network,
         )
         print(format_health_report(report))
@@ -1898,18 +1990,17 @@ def main() -> int:
     queue_url = env("QUEUE_URL")
     if not queue_url:
         raise SystemExit("QUEUE_URL is required")
-
     dedup = DedupStore(args.dedup_db or env("DEDUP_DB", default_dedup))
     trace_store = TraceStore(args.trace_db or env("TRACE_DB", default_trace))
     review_store = ReviewStore(args.review_db or env("REVIEW_DB", default_review))
+    poison_store = PoisonStore(args.poison_db or env("POISON_DB", default_poison))
     dedup.cleanup()
     client = sqs_client()
 
     while True:
-        run_once(client, queue_url, dedup, trace_store=trace_store, review_store=review_store)
+        run_once(client, queue_url, dedup, trace_store=trace_store, review_store=review_store, poison_store=poison_store)
         if args.once:
             return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

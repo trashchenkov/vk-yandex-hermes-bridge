@@ -238,7 +238,7 @@ network_mode: host
 
 `Dockerfile.worker` installs only runtime dependencies from `requirements-vm-worker.txt` and copies worker code/fixtures. It does not copy `.env`, does not bake secrets, and does not bake API keys into the image; `.dockerignore` excludes local secrets, state DBs, caches, and git metadata.
 
-State is persisted in the named Docker volume `vk-hermes-state`, so dedup/trace/review SQLite DBs survive container restarts. The default container command is the queue worker; for local/hobby mode you can override it with Long Poll:
+State is persisted in the named Docker volume `vk-hermes-state`, so dedup/trace/review/poison SQLite DBs survive container restarts. The default container command is the queue worker; for local/hobby mode you can override it with Long Poll:
 
 ```bash
 docker compose run --rm vk-hermes-worker python vm-worker/vk_hermes_worker.py --long-poll --once
@@ -266,6 +266,13 @@ HERMES_API_BASE=http://127.0.0.1:8642
 ```
 
 If `HERMES_API_KEY` is empty, the worker loads `API_SERVER_KEY` from `--hermes-env`, defaulting to `/root/.hermes/.env`.
+
+Queue poison-message handling is enabled for queue mode when `POISON_DB` is configured. The worker requests `ApproximateReceiveCount`; if processing the same queue message keeps failing and reaches `VK_POISON_MAX_RECEIVE_COUNT` (default `5`), it writes a redacted record to the poison SQLite store and deletes the queue message so it cannot retry forever:
+
+```text
+POISON_DB=./state/vk-worker-poison.sqlite3
+VK_POISON_MAX_RECEIVE_COUNT=5
+```
 
 ## Local fake mode
 
