@@ -177,7 +177,23 @@ chmod 600 .env
 - Create a function: https://yandex.cloud/ru/docs/functions/quickstart/create-function/
 - Function concepts and runtime settings: https://yandex.cloud/ru/docs/functions/concepts/function/
 
-Deploy `/tmp/vk-hermes-function.zip` to Yandex Cloud Functions with handler `index.handler` and env vars from `.env` relevant to the function:
+Deploy `/tmp/vk-hermes-function.zip` to Yandex Cloud Functions with handler `index.handler` and env vars from `.env` relevant to the function. For a command preview that does not call Yandex Cloud:
+
+```bash
+make deploy-function-dry-run
+# or
+DRY_RUN=1 ./scripts/deploy-yandex-function.sh --skip-build
+```
+
+For a real function version deploy after `yc` is authenticated/configured:
+
+```bash
+SERVICE_ACCOUNT_ID=<vm/function service account id> ./scripts/deploy-yandex-function.sh
+```
+
+The helper builds via `scripts/build-yandex-function-zip.sh`, creates a new `yc serverless function version create`, and prints the VK Callback URL. It reads secrets from `.env`/environment at runtime; dry-run output redacts secret values.
+
+Required function env vars:
 
 ```text
 BRIDGE_MODE=queue
