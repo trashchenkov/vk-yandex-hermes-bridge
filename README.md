@@ -88,6 +88,21 @@ For explicit env/file-configured rules, set `VK_POLICY_JSON` or `VK_POLICY_FILE`
 
 Owner commands still require the `owner` role. Group chats are denied unless configured mention triggers are present; even then they default to deny until a later public/RAG mode adds a safe answer path.
 
+## Public FAQ mode
+
+For a safe public mode that does not call the private Hermes backend, configure a public rule with `action=public_faq` and point `VK_PUBLIC_FAQ_PATHS` at markdown/txt community materials:
+
+```json
+{
+  "roles": {"owner": {"ids": ["123456789"]}},
+  "rules": {
+    "public": {"action": "public_faq", "hermes_allowed": false, "reason": "public_faq"}
+  }
+}
+```
+
+The worker searches only configured local sources, returns a short excerpt with `Sources:` citations, and never invents an answer. If no reliable source reaches `VK_PUBLIC_FAQ_MIN_SCORE`, it creates a pending review item when `REVIEW_DB` is configured; optionally set `VK_PUBLIC_FAQ_MISS_REPLY` to tell the user the question was handed off.
+
 ## Quick start
 
 1. Copy env template:

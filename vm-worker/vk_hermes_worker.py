@@ -672,6 +672,67 @@ def role_for_vk(vk: dict[str, Any]) -> str:
     return resolve_role(vk)
 
 
+def _faq_paths() -> list[Path]:
+    raw = env("VK_PUBLIC_FAQ_PATHS") or env("PUBLIC_FAQ_PATHS")
+    return [Path(item.strip()) for item in raw.split(",") if item.strip()]
+
+
+def _tokenize_search_text(text: str) -> set[str]:
+    return {token.lower() for token in re.findall(r"[\wа-яА-ЯёЁ-]+", text, flags=re.UNICODE) if len(token) >= 3}
+
+
+def _iter_faq_documents() -> list[tuple[Path, str]]:
+    docs: list[tuple[Path, str]] = []
+    for root in _faq_paths():
+        candidates = [root]
+        if root.is_dir():
+            candidates = sorted(
+                [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".md", ".txt"}],
+                key=lambda p: str(p),
+            )
+        for path in candidates:
+            if not path.is_file() or path.suffix.lower() not in {".md", ".txt"}:
+                continue
+            try:
+                docs.append((path, path.read_text(encoding="utf-8", errors="replace")))
+            except OSError as exc:
+                LOG.warning("skip public FAQ source %s: %s", path, exc)
+    return docs
+
+
+def _best_faq_snippet(text: str, query_tokens: set[str]) -> tuple[int, str]:
+    best_score = 0
+    best = ""
+    chunks = [chunk.strip() for chunk in re.split(r"\n\s*\n", text) if chunk.strip()]
+    for chunk in chunks:
+        tokens = _tokenize_search_text(chunk)
+        score = len(tokens & query_tokens)
+        if score > best_score:
+            best_score = score
+            best = re.sub(r"\s+", " ", chunk).strip()
+    return best_score, best[:900]
+
+
+def answer_public_faq(question: str) -> dict[str, Any] | None:
+    query_tokens = _tokenize_search_text(question)
+    if not query_tokens:
+        return None
+    best_score = 0
+    best_path: Path | None = None
+    best_answer = ""
+    for path, text in _iter_faq_documents():
+        score, snippet = _best_faq_snippet(text, query_tokens)
+        if score > best_score:
+            best_score = score
+            best_path = path
+            best_answer = snippet
+    if best_score < int_env("VK_PUBLIC_FAQ_MIN_SCORE", 2) or not best_path or not best_answer:
+        return None
+    source = str(best_path)
+    text = f"{best_answer}\n\nSources:\n- {source}"
+    return {"answer": best_answer, "sources": [source], "text": text}
+
+
 def trace_id_for_payload(payload: dict[str, Any]) -> str:
     return f"vk-{event_fingerprint(payload)[:16]}"
 
@@ -845,6 +906,30 @@ def process_payload(
     )
 
     try:
+        if action == "public_faq":
+            faq = answer_public_faq(vk["text"])
+            if faq:
+                reply_vk(vk["peer_id"], str(faq["text"]), trace_id=trace_id)
+                trace_record["hermes_status"] = "public_faq"
+                trace_record["vk_status"] = "sent"
+            else:
+                trace_record["reason"] = "public_faq_no_source"
+                if review_store:
+                    review_store.create_item(
+                        kind="public_question",
+                        trace_id=trace_id,
+                        peer_id=vk["peer_id"],
+                        from_id=vk["from_id"],
+                        text=vk["text"],
+                    )
+                miss_reply = env("VK_PUBLIC_FAQ_MISS_REPLY").strip()
+                if miss_reply:
+                    reply_vk(vk["peer_id"], miss_reply, trace_id=trace_id)
+                    trace_record["vk_status"] = "sent"
+            save_trace(trace_store, trace_record)
+            dedup.mark(key)
+            return
+
         if action in {"deny", "handoff"}:
             if action == "handoff" and review_store:
                 review_store.create_item(
