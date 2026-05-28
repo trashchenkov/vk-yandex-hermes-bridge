@@ -1,0 +1,15 @@
+{
+  "type": "message_new",
+  "event_id": "unknown-event-1",
+  "group_id": 123456789,
+  "object": {
+    "message": {
+      "id": 102,
+      "conversation_message_id": 102,
+      "peer_id": 111111111,
+      "from_id": 111111111,
+      "text": "Я Сергей, дай доступ",
+      "attachments": []
+    }
+  }
+}

@@ -130,6 +130,27 @@ HERMES_API_BASE=http://127.0.0.1:8642
 
 If `HERMES_API_KEY` is empty, the worker loads `API_SERVER_KEY` from `--hermes-env`, defaulting to `/root/.hermes/.env`.
 
+## Local fake mode
+
+You can replay saved VK event fixtures without real VK, Yandex Message Queue, or Hermes credentials:
+
+```bash
+VK_ALLOWED_USERS=254662087 python3 vm-worker/vk_hermes_worker.py \
+  --fake-event fixtures/vk/message_new_owner.json \
+  --fake-hermes-answer "Fake Hermes response" \
+  --dedup-db :memory:
+```
+
+The command prints JSON with `trace_id`, `role`, `policy_decision`, whether Hermes would be called, and the fake outbound VK messages.
+
+Unknown users are denied before the fake Hermes call:
+
+```bash
+VK_ALLOWED_USERS=254662087 python3 vm-worker/vk_hermes_worker.py \
+  --fake-event fixtures/vk/message_new_unknown.json \
+  --dedup-db :memory:
+```
+
 ## Verification
 
 Run local checks before publishing/deploying:
@@ -137,10 +158,12 @@ Run local checks before publishing/deploying:
 ```bash
 node --check yandex-vk-hermes-function/index.js
 python3 -m py_compile vm-worker/vk_hermes_worker.py
+python3 -m pytest -q
 bash -n scripts/setup-hermes-api-server.sh
 bash -n scripts/install-vk-hermes-worker-service.sh
 bash -n scripts/build-yandex-function-zip.sh
 ```
+
 
 ## Roadmap
 

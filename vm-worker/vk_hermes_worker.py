@@ -263,6 +263,16 @@ class DedupStore:
         self.db.commit()
 
 
+def role_for_vk(vk: dict[str, Any]) -> str:
+    if is_authorized(vk):
+        return "owner"
+    return "public"
+
+
+def trace_id_for_payload(payload: dict[str, Any]) -> str:
+    return f"vk-{event_fingerprint(payload)[:16]}"
+
+
 def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
     vk = normalize_vk_message(payload)
     if not vk["peer_id"]:
@@ -291,6 +301,56 @@ def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
         answer = call_hermes(vk)
         reply_vk(vk["peer_id"], answer)
     dedup.mark(key)
+
+
+def run_fake_event(
+    fixture_path: str | Path,
+    *,
+    fake_hermes_answer: str = "Fake Hermes response.",
+    dedup_path: str | Path = ":memory:",
+) -> dict[str, Any]:
+    payload = json.loads(Path(fixture_path).read_text(encoding="utf-8"))
+    vk = normalize_vk_message(payload)
+    outbound: list[dict[str, str]] = []
+    hermes_called = False
+
+    def fake_call_hermes(_: dict[str, Any]) -> str:
+        nonlocal hermes_called
+        hermes_called = True
+        return fake_hermes_answer
+
+    def fake_reply_vk(peer_id: str, text: str) -> None:
+        for chunk in split_for_vk(text):
+            outbound.append({"peer_id": str(peer_id), "message": chunk})
+
+    original_call_hermes = globals()["call_hermes"]
+    original_reply_vk = globals()["reply_vk"]
+    globals()["call_hermes"] = fake_call_hermes
+    globals()["reply_vk"] = fake_reply_vk
+    try:
+        dedup = DedupStore(dedup_path)
+        process_payload(payload, dedup)
+    finally:
+        globals()["call_hermes"] = original_call_hermes
+        globals()["reply_vk"] = original_reply_vk
+
+    role = role_for_vk(vk)
+    if not vk["peer_id"]:
+        decision = "skip"
+    elif vk["message"].get("out"):
+        decision = "skip"
+    elif role == "owner":
+        decision = "reply"
+    else:
+        decision = "deny"
+
+    return {
+        "trace_id": trace_id_for_payload(payload),
+        "role": role,
+        "policy_decision": decision,
+        "hermes_called": hermes_called,
+        "outbound_messages": outbound,
+    }
 
 
 def sqs_client():
@@ -335,6 +395,9 @@ def main() -> int:
     parser.add_argument("--env", default=default_env, help="bridge .env path")
     parser.add_argument("--hermes-env", default="/root/.hermes/.env", help="Hermes .env path for API_SERVER_KEY fallback")
     parser.add_argument("--once", action="store_true", help="process one poll cycle and exit")
+    parser.add_argument("--dedup-db", help="SQLite dedup store path")
+    parser.add_argument("--fake-event", help="process a saved VK event fixture without VK/Yandex/Hermes secrets")
+    parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event")
     args = parser.parse_args()
 
     load_dotenv(args.hermes_env)
@@ -345,11 +408,20 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    if args.fake_event:
+        result = run_fake_event(
+            args.fake_event,
+            fake_hermes_answer=args.fake_hermes_answer,
+            dedup_path=args.dedup_db or ":memory:",
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
     queue_url = env("QUEUE_URL")
     if not queue_url:
         raise SystemExit("QUEUE_URL is required")
 
-    dedup = DedupStore(env("DEDUP_DB", default_dedup))
+    dedup = DedupStore(args.dedup_db or env("DEDUP_DB", default_dedup))
     dedup.cleanup()
     client = sqs_client()
 

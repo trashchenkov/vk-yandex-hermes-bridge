@@ -1,0 +1,15 @@
+{
+  "type": "message_new",
+  "event_id": "owner-event-1",
+  "group_id": 123456789,
+  "object": {
+    "message": {
+      "id": 101,
+      "conversation_message_id": 101,
+      "peer_id": 254662087,
+      "from_id": 254662087,
+      "text": "Привет, Гермес",
+      "attachments": []
+    }
+  }
+}
