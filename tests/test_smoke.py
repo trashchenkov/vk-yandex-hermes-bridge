@@ -43,6 +43,19 @@ def test_run_smoke_executes_owner_and_public_fake_e2e(monkeypatch, tmp_path):
     assert by_name["public_fake_e2e"]["hermes_called"] is False
 
 
+def test_run_smoke_is_repeatable_with_same_state_dir(monkeypatch, tmp_path):
+    worker = load_worker()
+    monkeypatch.setenv("VK_ALLOWED_USERS", "254662087")
+    monkeypatch.delenv("VK_ALLOW_ALL_USERS", raising=False)
+
+    first = worker.run_smoke(fixture_dir=FIXTURES, state_dir=tmp_path, fake_hermes_answer="first")
+    second = worker.run_smoke(fixture_dir=FIXTURES, state_dir=tmp_path, fake_hermes_answer="second")
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert {check["status"] for check in second["checks"]} == {"ok"}
+
+
 def test_format_smoke_report_is_human_readable():
     worker = load_worker()
     text = worker.format_smoke_report({

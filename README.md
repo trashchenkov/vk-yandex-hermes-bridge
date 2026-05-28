@@ -143,6 +143,16 @@ VK_ALLOWED_USERS=254662087 python3 vm-worker/vk_hermes_worker.py \
 
 The command prints JSON with `trace_id`, `role`, `policy_decision`, whether Hermes would be called, and the fake outbound VK messages.
 
+For a one-command fake E2E smoke check that needs no real VK, Yandex, or Hermes secrets:
+
+```bash
+VK_ALLOWED_USERS=254662087 python3 vm-worker/vk_hermes_worker.py \
+  --smoke \
+  --state-dir /tmp/vk-hermes-smoke
+```
+
+The smoke command runs owner fixture → policy → fake Hermes → fake VK send and public fixture → default deny. It exits `0` on success and non-zero on failure, and prints the trace id plus final fake outbound payload for each path.
+
 Unknown users are denied before the fake Hermes call:
 
 ```bash

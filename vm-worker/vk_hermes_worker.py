@@ -762,7 +762,7 @@ def run_smoke(
             result = run_fake_event(
                 fixture,
                 fake_hermes_answer=fake_hermes_answer,
-                dedup_path=state_root / f"{name}-dedup.sqlite3",
+                dedup_path=":memory:",
             )
             ok = (
                 result["policy_decision"] == expected_decision
