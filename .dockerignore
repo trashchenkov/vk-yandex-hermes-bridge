@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+state/
+.git/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+*.log
+.DS_Store

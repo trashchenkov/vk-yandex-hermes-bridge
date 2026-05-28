@@ -1,0 +1,19 @@
+services:
+  vk-hermes-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: vk-yandex-hermes-bridge-worker:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env:ro
+      - vk-hermes-state:/app/state
+    network_mode: host
+    command:
+      - python
+      - vm-worker/vk_hermes_worker.py
+
+volumes:
+  vk-hermes-state:

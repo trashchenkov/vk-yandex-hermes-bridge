@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements-vm-worker.txt ./
+RUN pip install --no-cache-dir -r requirements-vm-worker.txt
+
+COPY vm-worker/ ./vm-worker/
+COPY fixtures/ ./fixtures/
+
+RUN useradd --create-home --uid 10001 worker \
+    && mkdir -p /app/state \
+    && chown -R worker:worker /app/state
+
+USER worker
+
+CMD ["python", "vm-worker/vk_hermes_worker.py"]

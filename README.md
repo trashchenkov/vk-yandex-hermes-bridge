@@ -184,13 +184,53 @@ Smoke test:
 curl -sS -H "Authorization: Bearer YOUR_API_SERVER_KEY" http://127.0.0.1:8642/v1/models
 ```
 
-7. Install and start worker:
+7. Install and start worker with systemd:
 
 ```bash
 ./scripts/install-vk-hermes-worker-service.sh
 systemctl restart vk-hermes-worker.service
 journalctl -u vk-hermes-worker.service -f
 ```
+
+## Docker Compose deployment
+
+As an alternative to the systemd worker, build and run the VM worker in Docker Compose:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+# edit .env with VK/Yandex/Hermes values; do not put secrets in docker-compose.yml
+
+docker compose build vk-hermes-worker
+docker compose up -d vk-hermes-worker
+docker compose logs -f vk-hermes-worker
+```
+
+The Compose recipe uses:
+
+```text
+env_file: .env
+volumes:
+  - ./.env:/app/.env:ro
+  - vk-hermes-state:/app/state
+network_mode: host
+```
+
+`Dockerfile.worker` installs only runtime dependencies from `requirements-vm-worker.txt` and copies worker code/fixtures. It does not copy `.env`, does not bake secrets, and does not bake API keys into the image; `.dockerignore` excludes local secrets, state DBs, caches, and git metadata.
+
+State is persisted in the named Docker volume `vk-hermes-state`, so dedup/trace/review SQLite DBs survive container restarts. The default container command is the queue worker; for local/hobby mode you can override it with Long Poll:
+
+```bash
+docker compose run --rm vk-hermes-worker python vm-worker/vk_hermes_worker.py --long-poll --once
+docker compose up -d vk-hermes-worker
+```
+
+Systemd vs Docker trade-offs:
+
+- systemd is simplest on the same VM as Hermes API Server, uses host paths directly, and integrates naturally with `journalctl`.
+- Docker Compose gives repeatable packaging, explicit runtime deps, and an isolated persistent state volume.
+- The Compose file uses `network_mode: host` so the worker can still reach a private Hermes API bound to `127.0.0.1:8642`; this is Linux-focused and less portable than systemd.
+- Neither mode should expose Hermes API publicly; keep `HERMES_API_BASE` on loopback or another private interface.
 
 ## Worker env
 
@@ -271,6 +311,7 @@ python3 -m pytest -q
 bash -n scripts/setup-hermes-api-server.sh
 bash -n scripts/install-vk-hermes-worker-service.sh
 bash -n scripts/build-yandex-function-zip.sh
+docker compose config >/dev/null
 ```
 
 Operational status checks:
