@@ -733,6 +733,66 @@ def run_fake_event(
     }
 
 
+def smoke_check(name: str, ok: bool, detail: str, **extra: Any) -> dict[str, Any]:
+    check: dict[str, Any] = {"name": name, "status": "ok" if ok else "fail", "detail": detail}
+    check.update(extra)
+    return check
+
+
+def run_smoke(
+    *,
+    fixture_dir: str | Path,
+    state_dir: str | Path,
+    fake_hermes_answer: str = "Smoke fake Hermes response.",
+) -> dict[str, Any]:
+    fixture_root = Path(fixture_dir)
+    state_root = Path(state_dir)
+    state_root.mkdir(parents=True, exist_ok=True)
+    checks: list[dict[str, Any]] = []
+
+    cases = [
+        ("owner_fake_e2e", fixture_root / "message_new_owner.json", "reply", True),
+        ("public_fake_e2e", fixture_root / "message_new_unknown.json", "deny", False),
+    ]
+    for name, fixture, expected_decision, expected_hermes_called in cases:
+        if not fixture.exists():
+            checks.append(smoke_check(name, False, f"missing fixture {fixture}"))
+            continue
+        try:
+            result = run_fake_event(
+                fixture,
+                fake_hermes_answer=fake_hermes_answer,
+                dedup_path=state_root / f"{name}-dedup.sqlite3",
+            )
+            ok = (
+                result["policy_decision"] == expected_decision
+                and bool(result["outbound_messages"])
+                and result["hermes_called"] is expected_hermes_called
+            )
+            detail = f"decision={result['policy_decision']} outbound={len(result['outbound_messages'])} hermes_called={result['hermes_called']}"
+            checks.append(smoke_check(
+                name,
+                ok,
+                detail,
+                trace_id=result["trace_id"],
+                outbound_count=len(result["outbound_messages"]),
+                hermes_called=result["hermes_called"],
+            ))
+        except Exception as exc:
+            checks.append(smoke_check(name, False, str(exc)))
+    return {"ok": all(check["status"] == "ok" for check in checks), "checks": checks}
+
+
+def format_smoke_report(report: dict[str, Any]) -> str:
+    lines = [f"Smoke: {'OK' if report.get('ok') else 'FAIL'}"]
+    for check in report.get("checks") or []:
+        line = f"[{check.get('status')}] {check.get('name')}: {check.get('detail')}"
+        if check.get("trace_id"):
+            line = f"{line} trace={check.get('trace_id')}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def doctor_check(name: str, ok: bool, detail: str, hint: str = "", status: str | None = None) -> dict[str, str]:
     check = {"name": name, "status": status or ("ok" if ok else "fail"), "detail": detail}
     if hint:
@@ -873,6 +933,7 @@ def main() -> int:
     default_dedup = str(default_state / "vk-worker-dedup.sqlite3")
     default_trace = str(default_state / "vk-worker-trace.sqlite3")
     default_review = str(default_state / "vk-worker-review.sqlite3")
+    default_fixture_dir = str(Path(__file__).resolve().parents[1] / "fixtures" / "vk")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default=default_env, help="bridge .env path")
@@ -885,6 +946,9 @@ def main() -> int:
     parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event")
     parser.add_argument("--doctor", action="store_true", help="check required config and local state stores")
     parser.add_argument("--doctor-network", action="store_true", help="also check Hermes API /health")
+    parser.add_argument("--smoke", action="store_true", help="run fake owner/public E2E smoke checks")
+    parser.add_argument("--fixture-dir", default=default_fixture_dir, help="VK fixture directory for --smoke")
+    parser.add_argument("--state-dir", default=str(default_state), help="state directory for --smoke temporary stores")
     args = parser.parse_args()
 
     load_dotenv(args.hermes_env)
@@ -912,6 +976,15 @@ def main() -> int:
             check_network=args.doctor_network,
         )
         print(format_doctor_report(report))
+        return 0 if report["ok"] else 2
+
+    if args.smoke:
+        report = run_smoke(
+            fixture_dir=args.fixture_dir,
+            state_dir=args.state_dir,
+            fake_hermes_answer=args.fake_hermes_answer,
+        )
+        print(format_smoke_report(report))
         return 0 if report["ok"] else 2
 
     queue_url = env("QUEUE_URL")
