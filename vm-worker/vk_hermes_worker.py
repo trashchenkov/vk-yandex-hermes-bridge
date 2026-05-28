@@ -273,6 +273,39 @@ def trace_id_for_payload(payload: dict[str, Any]) -> str:
     return f"vk-{event_fingerprint(payload)[:16]}"
 
 
+def summarize_attachments(attachments: list[Any]) -> list[dict[str, str]]:
+    """Return a safe attachment summary without nested VK access keys/tokens."""
+    summary: list[dict[str, str]] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        attachment_type = attachment.get("type")
+        if attachment_type:
+            summary.append({"type": str(attachment_type)})
+    return summary
+
+
+def build_event_envelope(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build the internal traceable event envelope used by fake and real paths."""
+    vk = normalize_vk_message(payload)
+    message = vk["message"]
+    return {
+        "trace_id": trace_id_for_payload(payload),
+        "event_type": str(payload.get("type") or ""),
+        "timestamp": message.get("date") or payload.get("date"),
+        "vk": {
+            "peer_id": vk["peer_id"],
+            "from_id": vk["from_id"],
+            "message_id": vk["message_id"],
+            "group_id": str(payload.get("group_id") or ""),
+            "event_id": str(payload.get("event_id") or ""),
+        },
+        "text": vk["text"],
+        "attachments": summarize_attachments(vk["attachments"]),
+        "raw_event_sha256": event_fingerprint(payload),
+    }
+
+
 def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
     vk = normalize_vk_message(payload)
     if not vk["peer_id"]:
