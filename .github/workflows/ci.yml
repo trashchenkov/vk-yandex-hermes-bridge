@@ -42,7 +42,19 @@ jobs:
         run: python -m py_compile vm-worker/vk_hermes_worker.py
 
       - name: Run Python tests
-        run: python -m pytest -q
+        run: |
+          set +e
+          python -m pytest -q 2>&1 | tee pytest.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('pytest.log').read_text(encoding='utf-8', errors='replace')
+          tail = text[-3500:].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f"::error title=pytest failed::{tail}")
+          PY
+          fi
+          exit "$status"
 
       - name: Check shell scripts
         run: |
