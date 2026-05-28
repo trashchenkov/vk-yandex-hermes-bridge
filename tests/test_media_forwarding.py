@@ -100,3 +100,108 @@ def test_public_attachments_are_not_forwarded_even_when_public_hermes_enabled(mo
 
     assert "public.pdf not forwarded: untrusted_role" in rendered
     assert "https://example.test/public.pdf" not in rendered
+
+
+def test_parse_outbound_media_keeps_text_and_allowed_local_files(monkeypatch, tmp_path):
+    worker = load_worker()
+    image = tmp_path / "plot.png"
+    image.write_bytes(b"png")
+    blocked = tmp_path / "malware.exe"
+    blocked.write_bytes(b"exe")
+    missing = tmp_path / "missing.pdf"
+    monkeypatch.setenv("VK_MEDIA_MAX_BYTES", "100")
+
+    parts = worker.parse_outbound_media_reply(f"ответ\nMEDIA:{image}\nMEDIA:{blocked}\nMEDIA:{missing}")
+
+    assert parts["message"] == "ответ"
+    assert parts["media_paths"] == [image]
+    assert parts["warnings"] == [
+        "MEDIA not attached: malware.exe unsupported_ext",
+        "MEDIA not attached: missing.pdf missing_file",
+    ]
+
+
+def test_parse_outbound_media_rejects_oversized_files(monkeypatch, tmp_path):
+    worker = load_worker()
+    doc = tmp_path / "large.pdf"
+    doc.write_bytes(b"x" * 10)
+    monkeypatch.setenv("VK_MEDIA_MAX_BYTES", "5")
+
+    parts = worker.parse_outbound_media_reply(f"MEDIA:{doc}")
+
+    assert parts["message"] == ""
+    assert parts["media_paths"] == []
+    assert parts["warnings"] == ["MEDIA not attached: large.pdf too_large"]
+
+
+def test_reply_vk_uploads_media_and_sends_attachment(monkeypatch, tmp_path):
+    worker = load_worker()
+    image = tmp_path / "plot.png"
+    image.write_bytes(b"png")
+    monkeypatch.setenv("VK_GROUP_TOKEN", "vk-token")
+    calls: list[dict] = []
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, data=None, files=None, timeout=None):
+        calls.append({"url": url, "data": data, "files": files, "timeout": timeout})
+        if url.endswith("photos.getMessagesUploadServer"):
+            return FakeResponse({"response": {"upload_url": "https://upload.example/photo"}})
+        if url == "https://upload.example/photo":
+            return FakeResponse({"server": 1, "photo": "[]", "hash": "h"})
+        if url.endswith("photos.saveMessagesPhoto"):
+            return FakeResponse({"response": [{"owner_id": 10, "id": 20, "access_key": "secret"}]})
+        if url.endswith("messages.send"):
+            return FakeResponse({"response": 1})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(worker.requests, "post", fake_post)
+
+    worker.reply_vk("123", f"готово\nMEDIA:{image}", trace_id="media-trace")
+
+    send = calls[-1]
+    assert send["url"].endswith("messages.send")
+    assert send["data"]["message"] == "готово"
+    assert send["data"]["attachment"] == "photo10_20_secret"
+
+
+def test_reply_vk_degrades_to_warning_when_media_upload_fails(monkeypatch, tmp_path):
+    worker = load_worker()
+    doc = tmp_path / "report.pdf"
+    doc.write_bytes(b"pdf")
+    monkeypatch.setenv("VK_GROUP_TOKEN", "vk-token")
+    sent: list[dict] = []
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, data=None, files=None, timeout=None):
+        if url.endswith("docs.getMessagesUploadServer"):
+            return FakeResponse({"response": {}})
+        if url.endswith("messages.send"):
+            sent.append(data)
+            return FakeResponse({"response": 1})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(worker.requests, "post", fake_post)
+
+    worker.reply_vk("123", f"ответ\nMEDIA:{doc}", trace_id="media-fail")
+
+    assert len(sent) == 1
+    assert sent[0]["message"] == "ответ\n\nMEDIA not attached: report.pdf upload_failed"
+    assert "attachment" not in sent[0]

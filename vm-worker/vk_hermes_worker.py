@@ -17,9 +17,11 @@ import random
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import boto3
 import requests
@@ -630,7 +632,83 @@ def build_vk_outbound_messages(peer_id: str, text: str, *, trace_id: str) -> lis
     ]
 
 
-def send_vk_message(peer_id: str, message: str, *, random_id: int | None = None) -> None:
+def parse_outbound_media_reply(text: str) -> dict[str, Any]:
+    message_lines: list[str] = []
+    media_paths: list[Path] = []
+    warnings: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("MEDIA:"):
+            message_lines.append(line)
+            continue
+        raw_path = stripped.removeprefix("MEDIA:").strip()
+        path = Path(raw_path).expanduser()
+        name = path.name or raw_path
+        ext = path.suffix.lower().lstrip(".")
+        if not path.exists() or not path.is_file():
+            warnings.append(f"MEDIA not attached: {name} missing_file")
+        elif ext not in media_allowed_exts():
+            warnings.append(f"MEDIA not attached: {name} unsupported_ext")
+        elif path.stat().st_size > media_max_bytes():
+            warnings.append(f"MEDIA not attached: {name} too_large")
+        else:
+            media_paths.append(path)
+    return {"message": "\n".join(message_lines).strip(), "media_paths": media_paths, "warnings": warnings}
+
+
+def _vk_method(method: str, data: dict[str, Any]) -> dict[str, Any]:
+    token = env("VK_GROUP_TOKEN")
+    if not token:
+        raise RuntimeError("VK_GROUP_TOKEN is required")
+    payload = {"access_token": token, "v": env("VK_API_VERSION", "5.199"), **data}
+    res = requests.post(f"https://api.vk.com/method/{method}", data=payload, timeout=30)
+    body = res.json()
+    if not res.ok or body.get("error"):
+        raise RuntimeError(f"VK {method} failed: HTTP {res.status_code} {str(body.get('error') or body)[:500]}")
+    return body
+
+
+def _upload_vk_photo(peer_id: str, path: Path) -> str:
+    server = _vk_method("photos.getMessagesUploadServer", {"peer_id": str(peer_id)}).get("response") or {}
+    upload_url = server.get("upload_url")
+    if not upload_url:
+        raise RuntimeError("missing photo upload_url")
+    with path.open("rb") as handle:
+        uploaded = requests.post(upload_url, files={"photo": (path.name, handle)}, timeout=60).json()
+    saved = _vk_method("photos.saveMessagesPhoto", {
+        "server": uploaded.get("server"),
+        "photo": uploaded.get("photo"),
+        "hash": uploaded.get("hash"),
+    }).get("response") or []
+    item = saved[0] if saved else {}
+    if not item.get("owner_id") or not item.get("id"):
+        raise RuntimeError("missing saved photo id")
+    access_key = f"_{item['access_key']}" if item.get("access_key") else ""
+    return f"photo{item['owner_id']}_{item['id']}{access_key}"
+
+
+def _upload_vk_doc(peer_id: str, path: Path) -> str:
+    server = _vk_method("docs.getMessagesUploadServer", {"peer_id": str(peer_id), "type": "doc"}).get("response") or {}
+    upload_url = server.get("upload_url")
+    if not upload_url:
+        raise RuntimeError("missing doc upload_url")
+    with path.open("rb") as handle:
+        uploaded = requests.post(upload_url, files={"file": (path.name, handle)}, timeout=60).json()
+    saved = _vk_method("docs.save", {"file": uploaded.get("file"), "title": path.name}).get("response") or {}
+    item = saved.get("doc") if isinstance(saved, dict) else {}
+    if not item.get("owner_id") or not item.get("id"):
+        raise RuntimeError("missing saved doc id")
+    access_key = f"_{item['access_key']}" if item.get("access_key") else ""
+    return f"doc{item['owner_id']}_{item['id']}{access_key}"
+
+
+def upload_vk_media(peer_id: str, path: Path) -> str:
+    if path.suffix.lower().lstrip(".") in {"jpg", "jpeg", "png", "gif", "webp"}:
+        return _upload_vk_photo(peer_id, path)
+    return _upload_vk_doc(peer_id, path)
+
+
+def send_vk_message(peer_id: str, message: str, *, random_id: int | None = None, attachment: str | None = None) -> None:
     token = env("VK_GROUP_TOKEN")
     if not token:
         raise RuntimeError("VK_GROUP_TOKEN is required")
@@ -641,6 +719,8 @@ def send_vk_message(peer_id: str, message: str, *, random_id: int | None = None)
         "random_id": str(random_id if random_id is not None else random.randint(1, 2_147_483_647)),
         "message": message,
     }
+    if attachment:
+        data["attachment"] = attachment
     res = requests.post("https://api.vk.com/method/messages.send", data=data, timeout=30)
     payload = res.json()
     if not res.ok or payload.get("error"):
@@ -649,8 +729,22 @@ def send_vk_message(peer_id: str, message: str, *, random_id: int | None = None)
 
 def reply_vk(peer_id: str, text: str, *, trace_id: str | None = None) -> None:
     actual_trace_id = trace_id or f"vk-send-{hashlib.sha256(f'{peer_id}:{text}'.encode('utf-8')).hexdigest()[:16]}"
-    for outbound in build_vk_outbound_messages(peer_id, text, trace_id=actual_trace_id):
-        send_vk_message(outbound["peer_id"], outbound["message"], random_id=outbound["random_id"])
+    media = parse_outbound_media_reply(text)
+    message = media["message"]
+    warnings = list(media["warnings"])
+    attachments: list[str] = []
+    for path in media["media_paths"]:
+        try:
+            attachments.append(upload_vk_media(peer_id, path))
+        except Exception as exc:
+            LOG.warning("VK media upload failed trace_id=%s path=%s error=%s", actual_trace_id, path, redact_secrets(exc))
+            warnings.append(f"MEDIA not attached: {path.name} upload_failed")
+    if warnings:
+        message = "\n\n".join(part for part in [message, "\n".join(warnings)] if part).strip()
+    attachment = ",".join(attachments) if attachments else None
+    for outbound in build_vk_outbound_messages(peer_id, message, trace_id=actual_trace_id):
+        send_vk_message(outbound["peer_id"], outbound["message"], random_id=outbound["random_id"], attachment=attachment)
+        attachment = None
 
 
 def event_fingerprint(payload: dict[str, Any]) -> str:

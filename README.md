@@ -118,9 +118,11 @@ The worker sends public requests with a separate `x-hermes-profile` and `x-herme
 
 Recommended public profile setup: create a dedicated Hermes profile (for example `hermes profile create vk-public`), disable risky toolsets for that profile, use separate memory, and avoid sharing the owner session key with public traffic.
 
-## Inbound media forwarding
+## Native media forwarding
 
-For owner/trusted traffic the worker can include safe VK attachment references in the Hermes input. It does not download files itself in this slice; it forwards redacted VK CDN URLs for supported photo/doc attachments and records why unsupported media was skipped.
+For owner/trusted inbound traffic the worker can include safe VK attachment references in the Hermes input. It does not download inbound files itself in this slice; it forwards redacted VK CDN URLs for supported photo/doc attachments and records why unsupported media was skipped.
+
+The worker also supports outbound `MEDIA:/absolute/path` lines in Hermes replies. Supported local image files are uploaded through VK photo upload APIs; other supported files are uploaded as VK documents. The visible text is sent as the message body, while invalid/missing/oversized media degrade to a short `MEDIA not attached: ...` warning instead of failing the whole reply.
 
 Controls:
 
@@ -130,10 +132,11 @@ VK_MEDIA_ALLOWED_EXTS=jpg,jpeg,png,gif,webp,pdf,txt,md,csv,json
 ```
 
 Rules:
-- only `owner` and `trusted` roles get media references;
+- only `owner` and `trusted` roles get inbound media references in Hermes input;
 - public/group_chat attachments are never forwarded to Hermes, even when public Hermes replies are enabled;
-- docs over `VK_MEDIA_MAX_BYTES` or with unsupported extensions degrade to a short `not forwarded` note;
-- attachment access keys in rendered URLs are redacted before entering Hermes input/logs.
+- inbound docs and outbound `MEDIA:` files over `VK_MEDIA_MAX_BYTES` or with unsupported extensions degrade to a short `not forwarded` / `not attached` note;
+- attachment access keys in rendered inbound URLs are redacted before entering Hermes input/logs;
+- outbound uploads use runtime local files only; `.env` and state files remain excluded from the Docker build context.
 
 ## Quick start
 
@@ -355,6 +358,6 @@ See `ROADMAP.md` for the broader roadmap: doctor/security checks, CI, replay too
 - Duplicate VK events are filtered with a SQLite dedup store.
 - `/help`, `помощь`, `/start`, `начать` are handled locally by the worker.
 - Responses are chunked below VK's 9000 character message limit.
-- Attachments are currently summarized by type and passed to Hermes as text metadata; native media forwarding can be added later.
+- Attachments: owner/trusted inbound photo/doc attachments are rendered as safe, redacted media references for Hermes; outbound `MEDIA:/path` reply lines are uploaded to VK when size/extension checks pass.
 
 See `docs/vk-yandex-hermes-bridge.md` for the detailed deployment reference.
