@@ -21,6 +21,7 @@ def test_check_script_exists_and_runs_core_quality_gates():
     assert "bash -n scripts/setup-hermes-api-server.sh" in text
     assert "bash -n scripts/install-vk-hermes-worker-service.sh" in text
     assert "bash -n scripts/build-yandex-function-zip.sh" in text
+    assert "bash -n scripts/deploy-yandex-function.sh" in text
     assert "docker compose config" in text
     assert "npm ci" not in text, "local check should not require network dependency install"
 

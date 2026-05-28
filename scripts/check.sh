@@ -16,6 +16,7 @@ echo "==> Shell syntax"
 bash -n scripts/setup-hermes-api-server.sh
 bash -n scripts/install-vk-hermes-worker-service.sh
 bash -n scripts/build-yandex-function-zip.sh
+bash -n scripts/deploy-yandex-function.sh
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   echo "==> Docker Compose config"
