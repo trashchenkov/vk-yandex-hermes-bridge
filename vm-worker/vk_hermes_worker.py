@@ -130,12 +130,18 @@ def is_owner_command(text: str) -> bool:
     return parse_owner_command(text) is not None
 
 
+def emergency_lockdown_enabled() -> bool:
+    return truthy_env("VK_EMERGENCY_LOCKDOWN") or truthy_env("VK_LOCKDOWN")
+
+
 def decide_policy(vk: dict[str, Any]) -> dict[str, Any]:
     role = resolve_role(vk)
     text = str(vk.get("text") or "")
     command = parse_owner_command(text)
     if role == "blocked":
         return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "blocked_user"}
+    if emergency_lockdown_enabled() and role != "owner":
+        return {"role": role, "action": "deny", "hermes_allowed": False, "reason": "emergency_lockdown"}
     if command:
         if role == "owner":
             return {"role": role, "action": "owner_command", "hermes_allowed": False, "reason": "owner_command", **command}
@@ -853,6 +859,10 @@ def run_doctor(
         ))
     else:
         checks.append(doctor_check("VK_ALLOW_ALL_USERS", True, "disabled"))
+    if emergency_lockdown_enabled():
+        checks.append(doctor_check("EMERGENCY_LOCKDOWN", True, "enabled: non-owner traffic is forced to deny"))
+    else:
+        checks.append(doctor_check("EMERGENCY_LOCKDOWN", True, "disabled"))
     base = env("HERMES_API_BASE", "http://127.0.0.1:8642").rstrip("/")
     if check_network:
         try:

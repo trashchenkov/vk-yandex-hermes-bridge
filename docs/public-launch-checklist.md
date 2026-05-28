@@ -118,15 +118,16 @@ Emergency lockdown must be available before public auto-reply or broader public 
 Until a dedicated control exists, the manual lockdown procedure is:
 
 ```text
+VK_EMERGENCY_LOCKDOWN=true
 VK_PUBLIC_HANDOFF=false
 VK_ALLOW_ALL_USERS=false
 VK_TRUSTED_USERS=
-VK_UNAUTHORIZED_REPLY=Бот на техническом обслуживании.
+VK_UNAUTHORIZED_REPLY=*** на техническом обслуживании.
 ```
 
-Then restart the worker service.
+Then restart the worker service and verify visibility with `python3 vm-worker/vk_hermes_worker.py --doctor`.
 
-Dedicated emergency lockdown should be implemented as an env flag or owner command before expanding beyond MVP.
+Dedicated owner-command toggling can be added before expanding beyond MVP.
 
 ## Launch decision
 
