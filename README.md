@@ -41,6 +41,8 @@ This repository is intended for private agent access, even if the VK community i
 
 Unknown VK users are blocked before any Hermes call. By default they receive: `Бот приватный. Доступ к Hermes Agent ограничен.` Set `VK_UNAUTHORIZED_MODE` to `ignore` to silently ignore them, `notify_owner` to send only an owner alert, or `reply_and_notify` to do both. Owner alerts use `VK_OWNER_PEER_ID` and include only sanitized sender/trace/text preview metadata.
 
+Set `VK_SHADOW_MODE=true` to test allowed-user traffic safely: the worker calls Hermes and stores trace status, but does not send the proposed answer to the original VK peer. Instead it sends a sanitized `Shadow VK answer` report to `VK_OWNER_PEER_ID`.
+
 ## Quick start
 
 1. Copy env template:

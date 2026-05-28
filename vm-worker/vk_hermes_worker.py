@@ -209,6 +209,33 @@ def notify_owner_about_unauthorized(vk: dict[str, Any], trace_id: str, decision:
     return True
 
 
+def shadow_mode_enabled() -> bool:
+    return truthy_env("VK_SHADOW_MODE")
+
+
+def format_owner_shadow_notification(vk: dict[str, Any], trace_id: str, decision: dict[str, Any], answer: str) -> str:
+    preview = redact_notification_text(str(answer).replace("\n", " "))[:500]
+    return "\n".join([
+        "Shadow VK answer",
+        f"trace={trace_id}",
+        f"from={vk.get('from_id', '')}",
+        f"peer={vk.get('peer_id', '')}",
+        f"role={decision.get('role', '')}",
+        f"decision={decision.get('action', '')}",
+        f"reason={decision.get('reason', '')}",
+        f"proposed={preview}",
+    ])
+
+
+def notify_owner_about_shadow(vk: dict[str, Any], trace_id: str, decision: dict[str, Any], answer: str) -> bool:
+    peer_id = owner_notification_peer_id()
+    if not peer_id:
+        LOG.warning("shadow notification skipped trace_id=%s reason=missing_owner_peer_id", trace_id)
+        return False
+    reply_vk(peer_id, format_owner_shadow_notification(vk, trace_id, decision, answer), trace_id=trace_id)
+    return True
+
+
 def is_help_command(text: str) -> bool:
     return text.strip().lower() in {"начать", "/start", "помощь", "/help"}
 
@@ -730,8 +757,12 @@ def process_payload(
                 trace_record["error"] = str(exc)[:500]
                 save_trace(trace_store, trace_record)
                 raise
-            reply_vk(vk["peer_id"], answer, trace_id=trace_id)
-            trace_record["vk_status"] = "sent"
+            if shadow_mode_enabled():
+                notify_owner_about_shadow(vk, trace_id, decision, answer)
+                trace_record["vk_status"] = "shadow_not_sent"
+            else:
+                reply_vk(vk["peer_id"], answer, trace_id=trace_id)
+                trace_record["vk_status"] = "sent"
         save_trace(trace_store, trace_record)
         dedup.mark(key)
     except Exception as exc:
