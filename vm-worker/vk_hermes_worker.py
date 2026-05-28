@@ -29,6 +29,28 @@ LOG = logging.getLogger("vk_hermes_worker")
 VK_MAX_MESSAGE_CHARS = 9000
 
 
+def redact_secrets(value: Any) -> str:
+    text = str(value)
+    text = re.sub(r"(?i)(access_key\s*=\s*)\S+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)\b([A-Z0-9_]*(?:token|secret|key|password|memory)[A-Z0-9_]*)(\s*[=:]\s*)\S+", r"\1\2[redacted]", text)
+    text = re.sub(r"\b[A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD|MEMORY|ACCESS_KEY)[A-Z0-9_]*\b", "[redacted]", text)
+    return text
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "level": record.levelname,
+            "logger": record.name,
+            "message": redact_secrets(record.getMessage()),
+            "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+        }
+        if record.exc_info:
+            payload["exception"] = redact_secrets(self.formatException(record.exc_info))
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 def load_dotenv(path: str | Path) -> None:
     p = Path(path)
     try:
@@ -182,10 +204,44 @@ def owner_notification_peer_id() -> str:
 
 
 def redact_notification_text(text: str) -> str:
-    redacted = re.sub(r"(?i)\b[A-Z0-9_]*(?:token|secret|key|password|memory)[A-Z0-9_]*\b", "[redacted]", text)
-    redacted = re.sub(r"(?i)(access_key\s*=\s*)\S+", r"\1[redacted]", redacted)
-    redacted = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", redacted)
-    return redacted
+    return redact_secrets(text)
+
+
+def redact_for_logs(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_notification_text(value)
+    if isinstance(value, dict):
+        return {str(k): redact_for_logs(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_for_logs(item) for item in value]
+    return value
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        event: dict[str, Any] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": redact_notification_text(record.getMessage()),
+        }
+        if record.exc_info:
+            event["exc_info"] = redact_notification_text(self.formatException(record.exc_info))
+        return json.dumps(redact_for_logs(event), ensure_ascii=False, separators=(",", ":"))
+
+
+def configure_logging() -> None:
+    level = getattr(logging, env("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    if env("LOG_FORMAT").strip().lower() == "json":
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonLogFormatter())
+        logging.basicConfig(level=level, handlers=[handler], force=True)
+    else:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            force=True,
+        )
 
 
 def format_owner_unauthorized_notification(vk: dict[str, Any], trace_id: str, decision: dict[str, Any]) -> str:
@@ -1112,6 +1168,76 @@ def format_doctor_report(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
+def health_component(name: str, status: str, detail: str, **extra: Any) -> dict[str, Any]:
+    component: dict[str, Any] = {"name": name, "status": status, "detail": redact_notification_text(str(detail))}
+    component.update(extra)
+    return component
+
+
+def run_health(
+    *,
+    mode: str = "queue",
+    dedup_db: str | Path,
+    trace_db: str | Path,
+    review_db: str | Path,
+    check_network: bool = False,
+) -> dict[str, Any]:
+    components: list[dict[str, Any]] = []
+    normalized_mode = "long_poll" if mode in {"long_poll", "long-poll"} else "queue"
+    components.append(health_component("worker", "ok", f"mode={normalized_mode}"))
+
+    if normalized_mode == "queue":
+        components.append(health_component(
+            "queue",
+            "ok" if env("QUEUE_URL") else "fail",
+            "configured" if env("QUEUE_URL") else "missing QUEUE_URL",
+        ))
+    else:
+        components.append(health_component("queue", "skip", "not used in long_poll mode"))
+
+    has_hermes_key = bool(env("HERMES_API_KEY") or env("API_SERVER_KEY"))
+    hermes_base = env("HERMES_API_BASE", "http://127.0.0.1:8642")
+    components.append(health_component(
+        "hermes",
+        "ok" if has_hermes_key and hermes_base else "fail",
+        f"base={hermes_base}; auth={'configured' if has_hermes_key else 'missing'}",
+    ))
+
+    has_vk_token = bool(env("VK_GROUP_TOKEN"))
+    has_vk_group = bool(env("VK_GROUP_ID")) if normalized_mode == "long_poll" else True
+    components.append(health_component(
+        "vk",
+        "ok" if has_vk_token and has_vk_group else "fail",
+        "token/group configured" if has_vk_token and has_vk_group else "missing VK_GROUP_TOKEN or VK_GROUP_ID",
+    ))
+
+    has_owner = bool(owner_vk_users())
+    components.append(health_component(
+        "policy",
+        "ok" if has_owner else "fail",
+        "owner allowlist configured" if has_owner else "missing VK_OWNER_ID or VK_ALLOWED_USERS",
+    ))
+
+    try:
+        DedupStore(dedup_db)
+        TraceStore(trace_db)
+        ReviewStore(review_db)
+        components.append(health_component("state_dbs", "ok", "dedup/trace/review stores opened"))
+    except Exception as exc:
+        components.append(health_component("state_dbs", "fail", str(exc)))
+
+    ok = all(component["status"] in {"ok", "skip"} for component in components)
+    return {"ok": ok, "mode": normalized_mode, "components": components}
+
+
+def format_health_report(report: dict[str, Any]) -> str:
+    lines = [f"Health: {'OK' if report.get('ok') else 'FAIL'}"]
+    for component in report.get("components") or []:
+        lines.append(f"[{component.get('status')}] {component.get('name')}: {component.get('detail')}")
+    return "\n".join(lines)
+
+
 def sqs_client():
     return boto3.client(
         "sqs",
@@ -1282,6 +1408,8 @@ def main() -> int:
     parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event/--replay")
     parser.add_argument("--doctor", action="store_true", help="check required config and local state stores")
     parser.add_argument("--doctor-network", action="store_true", help="also check Hermes API /health")
+    parser.add_argument("--health", action="store_true", help="print worker health/status summary")
+    parser.add_argument("--health-network", action="store_true", help="also check Hermes API /health for --health")
     parser.add_argument("--smoke", action="store_true", help="run fake owner/public E2E smoke checks")
     parser.add_argument("--fixture-dir", default=default_fixture_dir, help="VK fixture directory for --smoke")
     parser.add_argument("--state-dir", default=str(default_state), help="state directory for --smoke temporary stores")
@@ -1290,10 +1418,7 @@ def main() -> int:
     load_dotenv(args.hermes_env)
     load_dotenv(args.env)
 
-    logging.basicConfig(
-        level=getattr(logging, env("LOG_LEVEL", "INFO").upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging()
 
     if args.fake_event:
         result = run_fake_event(
@@ -1321,6 +1446,17 @@ def main() -> int:
             check_network=args.doctor_network,
         )
         print(format_doctor_report(report))
+        return 0 if report["ok"] else 2
+
+    if args.health:
+        report = run_health(
+            mode="long_poll" if args.long_poll else "queue",
+            dedup_db=args.dedup_db or env("DEDUP_DB", default_dedup),
+            trace_db=args.trace_db or env("TRACE_DB", default_trace),
+            review_db=args.review_db or env("REVIEW_DB", default_review),
+            check_network=args.health_network,
+        )
+        print(format_health_report(report))
         return 0 if report["ok"] else 2
 
     if args.smoke:
@@ -1358,3 +1494,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

@@ -54,6 +54,17 @@ python vm-worker/vk_hermes_worker.py --replay fixtures/vk/message_new_owner.json
 
 `--replay` uses fake Hermes/VK sends and prints policy decisions, trace IDs, outbound payload shape, duplicate handling, and simulated failure outcomes for fixtures such as `hermes_timeout.json` and `vk_send_failure.json`.
 
+## Health and structured logs
+
+Use the health command to check worker mode, queue/Long Poll config, Hermes config, VK config, policy allowlist, and SQLite state stores without exposing secrets:
+
+```bash
+python vm-worker/vk_hermes_worker.py --health
+python vm-worker/vk_hermes_worker.py --long-poll --health
+```
+
+For machine-parseable production logs set `LOG_FORMAT=json`. JSON logs include timestamp, level, logger and redacted message text.
+
 ## Quick start
 
 1. Copy env template:
@@ -209,6 +220,15 @@ bash -n scripts/install-vk-hermes-worker-service.sh
 bash -n scripts/build-yandex-function-zip.sh
 ```
 
+Operational status checks:
+
+```bash
+python3 vm-worker/vk_hermes_worker.py --health
+python3 vm-worker/vk_hermes_worker.py --long-poll --health
+LOG_FORMAT=json python3 vm-worker/vk_hermes_worker.py --health
+```
+
+`--health` reports worker, queue, Hermes, VK/policy, and state DB status with secrets redacted. Set `LOG_FORMAT=json` for machine-parseable logs.
 
 ## Roadmap
 
