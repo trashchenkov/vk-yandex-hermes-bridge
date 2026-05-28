@@ -333,8 +333,9 @@ def event_fingerprint(payload: dict[str, Any]) -> str:
 class DedupStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path)
+        if str(path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path))
         self.db.execute("CREATE TABLE IF NOT EXISTS processed (key TEXT PRIMARY KEY, created_at REAL NOT NULL)")
         self.db.commit()
 
@@ -350,6 +351,34 @@ class DedupStore:
         cutoff = time.time() - max_age_days * 86400
         self.db.execute("DELETE FROM processed WHERE created_at < ?", (cutoff,))
         self.db.commit()
+
+
+class TraceStore:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if str(path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path))
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS trace_records ("
+            "trace_id TEXT PRIMARY KEY, created_at REAL NOT NULL, record_json TEXT NOT NULL)"
+        )
+        self.db.commit()
+
+    def put(self, record: dict[str, Any]) -> None:
+        payload = dict(record)
+        payload.setdefault("created_at", time.time())
+        self.db.execute(
+            "INSERT OR REPLACE INTO trace_records (trace_id, created_at, record_json) VALUES (?, ?, ?)",
+            (payload["trace_id"], float(payload["created_at"]), json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+        )
+        self.db.commit()
+
+    def get(self, trace_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT record_json FROM trace_records WHERE trace_id = ?", (trace_id,)).fetchone()
+        if not row:
+            return None
+        return json.loads(row[0])
 
 
 def role_for_vk(vk: dict[str, Any]) -> str:
@@ -402,7 +431,51 @@ def build_event_envelope(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
+def new_trace_record(envelope: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "trace_id": envelope["trace_id"],
+        "envelope": envelope,
+        "role": str(policy.get("role") or ""),
+        "decision": str(policy.get("action") or ""),
+        "reason": str(policy.get("reason") or ""),
+        "hermes_status": "not_called",
+        "vk_status": "not_sent",
+        "error": "",
+    }
+
+
+def save_trace(trace_store: TraceStore | None, record: dict[str, Any] | None) -> None:
+    if trace_store and record:
+        trace_store.put(record)
+
+
+def format_trace_record(record: dict[str, Any]) -> str:
+    return " ".join([
+        f"Trace {record['trace_id']}:",
+        f"role={record.get('role', '')}",
+        f"decision={record.get('decision', '')}",
+        f"hermes={record.get('hermes_status', '')}",
+        f"vk={record.get('vk_status', '')}",
+        f"error={record.get('error', '')}" if record.get("error") else "error=none",
+    ])
+
+
+def handle_owner_command(vk: dict[str, Any], decision: dict[str, Any], trace_store: TraceStore | None) -> str:
+    command = str(decision.get("command") or "unknown")
+    args = [str(arg) for arg in decision.get("command_args") or []]
+    if command == "trace":
+        if not args:
+            return "Usage: !trace <trace_id>"
+        if not trace_store:
+            return "Trace store is not configured."
+        record = trace_store.get(args[0])
+        if not record:
+            return f"Trace {args[0]} not found."
+        return format_trace_record(record)
+    return f"Owner command !{command} accepted, but it is not implemented yet."
+
+
+def process_payload(payload: dict[str, Any], dedup: DedupStore, trace_store: TraceStore | None = None) -> None:
     vk = normalize_vk_message(payload)
     trace_id = trace_id_for_payload(payload)
     if not vk["peer_id"]:
@@ -420,6 +493,8 @@ def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
     decision = decide_policy(vk)
     role = str(decision["role"])
     action = str(decision["action"])
+    envelope = build_event_envelope(payload)
+    trace_record = new_trace_record(envelope, decision)
     log_level = logging.WARNING if action in {"deny", "handoff"} else logging.INFO
     LOG.log(
         log_level,
@@ -432,25 +507,46 @@ def process_payload(payload: dict[str, Any], dedup: DedupStore) -> None:
         vk["peer_id"],
     )
 
-    if action in {"deny", "handoff"}:
-        reply = unauthorized_reply_text()
-        if reply:
-            reply_vk(vk["peer_id"], reply, trace_id=trace_id)
-        dedup.mark(key)
-        return
+    try:
+        if action in {"deny", "handoff"}:
+            reply = unauthorized_reply_text()
+            if reply:
+                reply_vk(vk["peer_id"], reply, trace_id=trace_id)
+                trace_record["vk_status"] = "sent"
+            save_trace(trace_store, trace_record)
+            dedup.mark(key)
+            return
 
-    if action == "owner_command":
-        command = decision.get("command", "unknown")
-        reply_vk(vk["peer_id"], f"Owner command !{command} accepted, but it is not implemented yet.", trace_id=trace_id)
-        dedup.mark(key)
-        return
+        if action == "owner_command":
+            reply_vk(vk["peer_id"], handle_owner_command(vk, decision, trace_store), trace_id=trace_id)
+            trace_record["vk_status"] = "sent"
+            save_trace(trace_store, trace_record)
+            dedup.mark(key)
+            return
 
-    if is_help_command(vk["text"]):
-        reply_vk(vk["peer_id"], help_text(), trace_id=trace_id)
-    else:
-        answer = call_hermes(vk)
-        reply_vk(vk["peer_id"], answer, trace_id=trace_id)
-    dedup.mark(key)
+        if is_help_command(vk["text"]):
+            reply_vk(vk["peer_id"], help_text(), trace_id=trace_id)
+            trace_record["vk_status"] = "sent"
+        else:
+            try:
+                answer = call_hermes(vk)
+                trace_record["hermes_status"] = "ok"
+            except Exception as exc:
+                trace_record["hermes_status"] = "error"
+                trace_record["error"] = str(exc)[:500]
+                save_trace(trace_store, trace_record)
+                raise
+            reply_vk(vk["peer_id"], answer, trace_id=trace_id)
+            trace_record["vk_status"] = "sent"
+        save_trace(trace_store, trace_record)
+        dedup.mark(key)
+    except Exception as exc:
+        if not trace_record.get("error"):
+            trace_record["error"] = str(exc)[:500]
+        if trace_record.get("vk_status") == "not_sent" and trace_record.get("hermes_status") != "error":
+            trace_record["vk_status"] = "error"
+        save_trace(trace_store, trace_record)
+        raise
 
 
 def run_fake_event(
@@ -512,7 +608,7 @@ def sqs_client():
     )
 
 
-def run_once(client: Any, queue_url: str, dedup: DedupStore) -> int:
+def run_once(client: Any, queue_url: str, dedup: DedupStore, trace_store: TraceStore | None = None) -> int:
     res = client.receive_message(
         QueueUrl=queue_url,
         MaxNumberOfMessages=int_env("QUEUE_MAX_MESSAGES", 1),
@@ -529,7 +625,7 @@ def run_once(client: Any, queue_url: str, dedup: DedupStore) -> int:
             client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
             continue
         try:
-            process_payload(payload, dedup)
+            process_payload(payload, dedup, trace_store=trace_store)
         except Exception:
             LOG.exception("processing failed; leaving message for retry")
             continue
@@ -539,13 +635,16 @@ def run_once(client: Any, queue_url: str, dedup: DedupStore) -> int:
 
 def main() -> int:
     default_env = str(Path(__file__).resolve().parents[1] / ".env")
-    default_dedup = str(Path(__file__).resolve().parents[1] / "state" / "vk-worker-dedup.sqlite3")
+    default_state = Path(__file__).resolve().parents[1] / "state"
+    default_dedup = str(default_state / "vk-worker-dedup.sqlite3")
+    default_trace = str(default_state / "vk-worker-trace.sqlite3")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default=default_env, help="bridge .env path")
     parser.add_argument("--hermes-env", default="/root/.hermes/.env", help="Hermes .env path for API_SERVER_KEY fallback")
     parser.add_argument("--once", action="store_true", help="process one poll cycle and exit")
     parser.add_argument("--dedup-db", help="SQLite dedup store path")
+    parser.add_argument("--trace-db", help="SQLite trace store path")
     parser.add_argument("--fake-event", help="process a saved VK event fixture without VK/Yandex/Hermes secrets")
     parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event")
     args = parser.parse_args()
@@ -572,11 +671,12 @@ def main() -> int:
         raise SystemExit("QUEUE_URL is required")
 
     dedup = DedupStore(args.dedup_db or env("DEDUP_DB", default_dedup))
+    trace_store = TraceStore(args.trace_db or env("TRACE_DB", default_trace))
     dedup.cleanup()
     client = sqs_client()
 
     while True:
-        run_once(client, queue_url, dedup)
+        run_once(client, queue_url, dedup, trace_store=trace_store)
         if args.once:
             return 0
 
