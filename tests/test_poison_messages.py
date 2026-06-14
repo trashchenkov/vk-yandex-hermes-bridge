@@ -82,6 +82,7 @@ def test_run_once_leaves_failed_message_for_retry_below_poison_threshold(monkeyp
 def test_run_once_moves_repeated_failure_to_poison_store_and_deletes_queue_message(monkeypatch, tmp_path):
     worker = load_worker()
     monkeypatch.setenv("VK_OWNER_ID", "1")
+    monkeypatch.setenv("VK_PROGRESS_ENABLED", "false")
     monkeypatch.setenv("VK_POISON_MAX_RECEIVE_COUNT", "3")
     monkeypatch.setattr(worker, "call_hermes", lambda vk: (_ for _ in ()).throw(RuntimeError("Hermes down token=secret")))
     client = FakeQueueClient(vk_event(), receive_count="3")

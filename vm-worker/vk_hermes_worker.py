@@ -507,6 +507,8 @@ def extract_hermes_text(data: Any) -> str:
     if not isinstance(data, dict):
         return ""
     output = data.get("output")
+    if isinstance(output, str) and output.strip():
+        return output.strip()
     if isinstance(output, list):
         parts: list[str] = []
         for item in output:
@@ -550,9 +552,7 @@ def call_hermes_config(vk: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def call_hermes(vk: dict[str, Any]) -> str:
-    config = call_hermes_config(vk)
-    base = config["base"]
+def hermes_headers(config: dict[str, str]) -> dict[str, str]:
     key = config["key"]
     if not key:
         raise RuntimeError("HERMES_API_KEY or API_SERVER_KEY is required")
@@ -563,17 +563,26 @@ def call_hermes(vk: dict[str, Any]) -> str:
     }
     if config.get("profile"):
         headers["x-hermes-profile"] = config["profile"]
-    payload = {
+    return headers
+
+
+def hermes_payload(vk: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
+    return {
         "model": config["model"],
         "input": build_hermes_input(vk),
         "instructions": hermes_instructions(vk),
         "conversation": config["session_key"],
         "store": True,
     }
+
+
+def call_hermes(vk: dict[str, Any]) -> str:
+    config = call_hermes_config(vk)
+    base = config["base"]
     res = requests.post(
         f"{base}/v1/responses",
-        headers=headers,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=hermes_headers(config),
+        data=json.dumps(hermes_payload(vk, config), ensure_ascii=False).encode("utf-8"),
         timeout=int_env("HERMES_TIMEOUT_MS", 120000) / 1000,
     )
     text = res.text
@@ -586,6 +595,184 @@ def call_hermes(vk: dict[str, Any]) -> str:
     answer = extract_hermes_text(data)
     if not answer:
         raise RuntimeError("Hermes API returned no assistant text")
+    return answer
+
+
+def progress_enabled_for(vk: dict[str, Any]) -> bool:
+    if not truthy_env("VK_PROGRESS_ENABLED"):
+        return False
+    if env("VK_HERMES_RUNS_ENABLED") and not truthy_env("VK_HERMES_RUNS_ENABLED"):
+        return False
+    if truthy_env("VK_PROGRESS_ALLOW_NON_OWNER"):
+        return True
+    return resolve_role(vk) == "owner"
+
+
+PROGRESS_TOOL_EMOJI = {
+    "skill_view": "📚",
+    "skill_manage": "📝",
+    "todo": "📋",
+    "terminal": "💻",
+    "search_files": "🔎",
+    "read_file": "📖",
+    "write_file": "✍️",
+    "patch": "✍️",
+}
+
+
+def _progress_emoji(tool: str) -> str:
+    if tool.startswith("browser_"):
+        return "🌐"
+    if tool.startswith("web_"):
+        return "🔍"
+    return PROGRESS_TOOL_EMOJI.get(tool, "🔧")
+
+
+def parse_sse_events(chunks: Any):
+    event_name = ""
+    data_lines: list[str] = []
+
+    def flush():
+        nonlocal event_name, data_lines
+        if not data_lines:
+            event_name = ""
+            return None
+        raw = "\n".join(data_lines).strip()
+        event = {"data": raw}
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                event = parsed
+        except json.JSONDecodeError:
+            pass
+        if event_name:
+            event.setdefault("event", event_name)
+        event_name = ""
+        data_lines = []
+        return event
+
+    for chunk in chunks:
+        if chunk in (b"", ""):
+            event = flush()
+            if event is not None:
+                yield event
+            continue
+        text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+        for line in text.splitlines():
+            if line == "":
+                event = flush()
+                if event is not None:
+                    yield event
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_name = line.split(":", 1)[1].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line.split(":", 1)[1].lstrip())
+    event = flush()
+    if event is not None:
+        yield event
+
+
+def format_progress_event(event: dict[str, Any]) -> str:
+    tool = str(event.get("tool") or event.get("name") or event.get("tool_name") or "").strip()
+    if not tool:
+        return ""
+    label = str(event.get("label") or event.get("preview") or event.get("input") or event.get("status") or tool)
+    label = redact_secrets(label).replace("\n", " ").strip()
+    max_label = max(20, int_env("VK_PROGRESS_LABEL_MAX_CHARS", 90))
+    truncated = False
+    if len(label) > max_label:
+        label = label[: max_label - 1].rstrip()
+        truncated = True
+    suffix = "…" if truncated else ""
+    return f'{_progress_emoji(tool)} {tool}: "{label}{suffix}"'
+
+
+class VkProgressSink:
+    def __init__(self, peer_id: str, trace_id: str, *, send_func=None, clock=time.monotonic):
+        self.peer_id = str(peer_id)
+        self.trace_id = trace_id
+        self.send_func = send_func or reply_vk
+        self.clock = clock
+        self.lines: list[str] = []
+        self.sent_count = 0
+        self.last_sent_at = self.clock()
+
+    def add_line(self, line: str) -> None:
+        line = redact_secrets(line).strip()
+        if not line:
+            return
+        if self.lines and self.lines[-1] == line:
+            return
+        self.lines.append(line)
+        max_lines = max(1, int_env("VK_PROGRESS_MAX_LINES", 25))
+        if len(self.lines) > max_lines:
+            self.lines = self.lines[-max_lines:]
+
+    def flush(self, *, force: bool = False) -> None:
+        if not self.lines:
+            return
+        now = self.clock()
+        interval = max(0, int_env("VK_PROGRESS_FLUSH_INTERVAL_MS", 1200)) / 1000
+        if not force and now - self.last_sent_at < interval:
+            return
+        max_chars = max(200, int_env("VK_PROGRESS_MAX_MESSAGE_CHARS", 3500))
+        body = "Работаю...\n" + "\n".join(self.lines)
+        if len(body) > max_chars:
+            body = body[: max_chars - 1].rstrip() + "…"
+        try:
+            self.send_func(self.peer_id, body, trace_id=f"{self.trace_id}-progress-{self.sent_count}")
+            self.sent_count += 1
+            self.last_sent_at = now
+        except Exception as exc:
+            LOG.warning("VK progress send failed trace_id=%s error=%s", self.trace_id, redact_secrets(exc))
+
+
+def call_hermes_with_progress(vk: dict[str, Any], *, send_progress=None, trace_id: str | None = None) -> str:
+    config = call_hermes_config(vk)
+    base = config["base"]
+    headers = hermes_headers(config)
+    timeout = int_env("HERMES_TIMEOUT_MS", 120000) / 1000
+    run_res = requests.post(
+        f"{base}/v1/runs",
+        headers=headers,
+        data=json.dumps(hermes_payload(vk, config), ensure_ascii=False).encode("utf-8"),
+        timeout=timeout,
+    )
+    if not run_res.ok:
+        raise RuntimeError(f"Hermes runs API HTTP {run_res.status_code}: {run_res.text[:500]}")
+    run_data = run_res.json()
+    run_id = str(run_data.get("id") or run_data.get("run_id") or "")
+    if not run_id:
+        raise RuntimeError("Hermes runs API returned no run id")
+
+    actual_trace_id = trace_id or f"vk-run-{run_id}"
+    sink = VkProgressSink(vk["peer_id"], actual_trace_id, send_func=send_progress)
+    try:
+        events_res = requests.get(f"{base}/v1/runs/{run_id}/events", headers=headers, timeout=timeout, stream=True)
+        if events_res.ok:
+            for event in parse_sse_events(events_res.iter_lines(decode_unicode=False)):
+                line = format_progress_event(event)
+                if line:
+                    sink.add_line(line)
+                    sink.flush(force=False)
+    except Exception as exc:
+        LOG.warning("Hermes run events failed trace_id=%s run_id=%s error=%s", actual_trace_id, run_id, redact_secrets(exc))
+    sink.flush(force=True)
+
+    final_res = requests.get(f"{base}/v1/runs/{run_id}", headers=headers, timeout=timeout)
+    if not final_res.ok:
+        raise RuntimeError(f"Hermes run status HTTP {final_res.status_code}: {final_res.text[:500]}")
+    final_data = final_res.json()
+    answer = extract_hermes_text(final_data)
+    if not answer and isinstance(final_data.get("result"), dict):
+        answer = extract_hermes_text(final_data["result"])
+    if not answer and isinstance(final_data.get("response"), dict):
+        answer = extract_hermes_text(final_data["response"])
+    if not answer:
+        raise RuntimeError("Hermes run returned no assistant text")
     return answer
 
 
@@ -1359,7 +1546,10 @@ def process_payload(
             trace_record["vk_status"] = "sent"
         else:
             try:
-                answer = call_hermes(vk)
+                if progress_enabled_for(vk):
+                    answer = call_hermes_with_progress(vk, send_progress=reply_vk, trace_id=trace_id)
+                else:
+                    answer = call_hermes(vk)
                 trace_record["hermes_status"] = "ok"
             except Exception as exc:
                 trace_record["hermes_status"] = "error"
@@ -1404,14 +1594,17 @@ def run_fake_event(
         outbound.extend(build_vk_outbound_messages(peer_id, text, trace_id=actual_trace_id))
 
     original_call_hermes = globals()["call_hermes"]
+    original_call_hermes_with_progress = globals()["call_hermes_with_progress"]
     original_reply_vk = globals()["reply_vk"]
     globals()["call_hermes"] = fake_call_hermes
+    globals()["call_hermes_with_progress"] = lambda vk, **kwargs: fake_call_hermes(vk)
     globals()["reply_vk"] = fake_reply_vk
     try:
         dedup = DedupStore(dedup_path)
         process_payload(payload, dedup)
     finally:
         globals()["call_hermes"] = original_call_hermes
+        globals()["call_hermes_with_progress"] = original_call_hermes_with_progress
         globals()["reply_vk"] = original_reply_vk
 
     if not vk["peer_id"]:
@@ -1465,8 +1658,10 @@ def run_replay_fixture(
         outbound.extend(build_vk_outbound_messages(peer_id, text, trace_id=actual_trace_id))
 
     original_call_hermes = globals()["call_hermes"]
+    original_call_hermes_with_progress = globals()["call_hermes_with_progress"]
     original_reply_vk = globals()["reply_vk"]
     globals()["call_hermes"] = fake_call_hermes
+    globals()["call_hermes_with_progress"] = lambda vk, **kwargs: fake_call_hermes(vk)
     globals()["reply_vk"] = fake_reply_vk
     trace_store = TraceStore(":memory:")
     duplicate_skipped = False
@@ -1485,6 +1680,7 @@ def run_replay_fixture(
             error = "fixture root is not a JSON object"
     finally:
         globals()["call_hermes"] = original_call_hermes
+        globals()["call_hermes_with_progress"] = original_call_hermes_with_progress
         globals()["reply_vk"] = original_reply_vk
 
     if isinstance(payload, dict):
