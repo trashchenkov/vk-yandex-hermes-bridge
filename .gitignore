@@ -1,6 +1,7 @@
 # secrets and local state
 .env
 *.env
+.env.bak-*
 !.env.example
 state/
 *.sqlite3

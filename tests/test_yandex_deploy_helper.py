@@ -21,6 +21,9 @@ def test_deploy_helper_exists_and_has_safe_shell_contract():
     assert "yc serverless function version create" in text
     assert "VK_CALLBACK_URL" in text
     assert "VK_SECRET" not in text or "${VK_SECRET" in text
+    assert "VK_GROUP_TOKEN" not in text
+    assert "--format json" in text
+    assert "Created function version:" in text
     assert "AWS_SECRET_ACCESS_KEY" not in text or "${AWS_SECRET_ACCESS_KEY" in text
 
 
@@ -51,6 +54,7 @@ def test_deploy_helper_dry_run_does_not_require_yc_or_network():
     assert "DRY RUN" in result.stdout
     assert "yc serverless function version create" in result.stdout
     assert "vk-hermes-callback" in result.stdout
+    assert "VK_GROUP_TOKEN" not in result.stdout
     assert "VK Callback URL:" in result.stdout
 
 

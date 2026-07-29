@@ -15,6 +15,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 import sys
 import tempfile
@@ -754,6 +755,9 @@ def call_hermes_with_progress(vk: dict[str, Any], *, send_progress=None, trace_i
         events_res = requests.get(f"{base}/v1/runs/{run_id}/events", headers=headers, timeout=timeout, stream=True)
         if events_res.ok:
             for event in parse_sse_events(events_res.iter_lines(decode_unicode=False)):
+                if event.get("event") == "approval.request":
+                    handle_approval_request(vk, run_id, event, trace_id=actual_trace_id)
+                    continue
                 line = format_progress_event(event)
                 if line:
                     sink.add_line(line)
@@ -930,7 +934,14 @@ def upload_vk_media(peer_id: str, path: Path) -> str:
     return _upload_vk_doc(peer_id, path)
 
 
-def send_vk_message(peer_id: str, message: str, *, random_id: int | None = None, attachment: str | None = None) -> None:
+def send_vk_message(
+    peer_id: str,
+    message: str,
+    *,
+    random_id: int | None = None,
+    attachment: str | None = None,
+    keyboard: str | None = None,
+) -> None:
     token = env("VK_GROUP_TOKEN")
     if not token:
         raise RuntimeError("VK_GROUP_TOKEN is required")
@@ -943,6 +954,8 @@ def send_vk_message(peer_id: str, message: str, *, random_id: int | None = None,
     }
     if attachment:
         data["attachment"] = attachment
+    if keyboard:
+        data["keyboard"] = keyboard
     res = requests.post("https://api.vk.com/method/messages.send", data=data, timeout=30)
     payload = res.json()
     if not res.ok or payload.get("error"):
@@ -986,6 +999,353 @@ def event_fingerprint(payload: dict[str, Any]) -> str:
         vk["text"],
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class ApprovalDecisionError(RuntimeError):
+    """A safe, user-facing rejection of an approval decision."""
+
+
+class HermesApprovalNotPending(RuntimeError):
+    """The target run no longer has a pending approval to resolve."""
+
+
+class ApprovalStore:
+    COLUMNS = (
+        "approval_id", "approval_code", "run_id", "ordinal", "peer_id", "requester_id",
+        "command_preview", "description", "choices_json", "status", "created_at",
+        "expires_at", "resolved_at", "choice", "approver_id",
+    )
+
+    def __init__(self, path: str | Path, *, clock=time.time):
+        self.path = Path(path)
+        self.clock = clock
+        if str(path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path), timeout=30)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS execution_approvals ("
+            "approval_id TEXT PRIMARY KEY, approval_code TEXT UNIQUE NOT NULL, run_id TEXT NOT NULL, "
+            "ordinal INTEGER NOT NULL, peer_id TEXT NOT NULL, requester_id TEXT NOT NULL, "
+            "command_preview TEXT NOT NULL, description TEXT NOT NULL, choices_json TEXT NOT NULL, "
+            "status TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL, "
+            "resolved_at REAL, choice TEXT, approver_id TEXT)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_execution_approvals_run_order "
+            "ON execution_approvals(run_id, ordinal)"
+        )
+        self.db.commit()
+
+    @classmethod
+    def _row(cls, row: tuple[Any, ...] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        record = dict(zip(cls.COLUMNS, row))
+        record["choices"] = json.loads(record.pop("choices_json"))
+        return record
+
+    def get(self, approval_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            f"SELECT {', '.join(self.COLUMNS)} FROM execution_approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        return self._row(row)
+
+    def get_by_code(self, approval_code: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            f"SELECT {', '.join(self.COLUMNS)} FROM execution_approvals WHERE approval_code = ?",
+            (approval_code.upper(),),
+        ).fetchone()
+        return self._row(row)
+
+    def create(
+        self,
+        *,
+        run_id: str,
+        peer_id: str,
+        requester_id: str,
+        command: str,
+        description: str,
+        choices: list[str],
+        ttl_seconds: int = 240,
+    ) -> dict[str, Any]:
+        now = float(self.clock())
+        safe_choices = [choice for choice in choices if choice in {"once", "session", "deny"}]
+        if "deny" not in safe_choices:
+            safe_choices.append("deny")
+        approval_id = secrets.token_urlsafe(12)
+        approval_code = secrets.token_hex(4).upper()
+        with self.db:
+            row = self.db.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM execution_approvals WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            ordinal = int(row[0] if row else 1)
+            self.db.execute(
+                "INSERT INTO execution_approvals (approval_id, approval_code, run_id, ordinal, peer_id, "
+                "requester_id, command_preview, description, choices_json, status, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    approval_id, approval_code, run_id, ordinal, str(peer_id), str(requester_id),
+                    redact_secrets(command)[:2000], redact_secrets(description)[:1000],
+                    json.dumps(safe_choices), now, now + max(1, ttl_seconds),
+                ),
+            )
+        record = self.get(approval_id)
+        assert record is not None
+        return record
+
+    def claim(
+        self,
+        approval_id: str,
+        *,
+        approver_id: str,
+        peer_id: str,
+        choice: str,
+    ) -> dict[str, Any]:
+        now = float(self.clock())
+        with self.db:
+            self.db.execute(
+                "UPDATE execution_approvals SET status = 'expired', resolved_at = ? "
+                "WHERE status = 'pending' AND expires_at <= ?",
+                (now, now),
+            )
+            record = self.get(approval_id)
+            if record is None:
+                raise ApprovalDecisionError("unknown_approval")
+            if str(approver_id) != str(record["requester_id"]):
+                raise ApprovalDecisionError("unauthorized")
+            if str(peer_id) != str(record["peer_id"]):
+                raise ApprovalDecisionError("peer_mismatch")
+            if record["status"] == "expired" or float(record["expires_at"]) <= now:
+                raise ApprovalDecisionError("expired")
+            if record["status"] != "pending":
+                raise ApprovalDecisionError("already_resolved")
+            if choice not in record["choices"]:
+                raise ApprovalDecisionError("choice_not_allowed")
+            older = self.db.execute(
+                "SELECT 1 FROM execution_approvals WHERE run_id = ? AND ordinal < ? "
+                "AND status IN ('pending', 'resolving') LIMIT 1",
+                (record["run_id"], record["ordinal"]),
+            ).fetchone()
+            if older:
+                raise ApprovalDecisionError("not_head")
+            updated = self.db.execute(
+                "UPDATE execution_approvals SET status = 'resolving', choice = ?, approver_id = ? "
+                "WHERE approval_id = ? AND status = 'pending'",
+                (choice, str(approver_id), approval_id),
+            ).rowcount
+            if updated != 1:
+                raise ApprovalDecisionError("already_resolved")
+        claimed = self.get(approval_id)
+        assert claimed is not None
+        return claimed
+
+    def release(self, approval_id: str) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE execution_approvals SET status = 'pending', choice = NULL, approver_id = NULL "
+                "WHERE approval_id = ? AND status = 'resolving'",
+                (approval_id,),
+            )
+
+    def recover_interrupted(self) -> int:
+        """Fail closed after a worker restart; a Hermes POST may already have succeeded."""
+        now = float(self.clock())
+        with self.db:
+            return self.db.execute(
+                "UPDATE execution_approvals SET status = 'uncertain', resolved_at = ? "
+                "WHERE status = 'resolving'",
+                (now,),
+            ).rowcount
+
+    def finish(self, approval_id: str, *, status: str, choice: str, approver_id: str) -> None:
+        if status not in {"approved", "denied", "expired", "stale", "uncertain", "error"}:
+            raise ValueError("invalid approval status")
+        with self.db:
+            self.db.execute(
+                "UPDATE execution_approvals SET status = ?, choice = ?, approver_id = ?, resolved_at = ? "
+                "WHERE approval_id = ?",
+                (status, choice, str(approver_id), float(self.clock()), approval_id),
+            )
+
+
+def approval_db_path() -> str:
+    default = Path(__file__).resolve().parents[1] / "state" / "vk-worker-approvals.sqlite3"
+    return env("APPROVAL_DB", str(default))
+
+
+def build_approval_keyboard(record: dict[str, Any]) -> dict[str, Any]:
+    labels = {
+        "once": ("Разрешить один раз", "positive"),
+        "session": ("До конца запуска", "primary"),
+        "deny": ("Отклонить", "negative"),
+    }
+    buttons = []
+    for choice in ("once", "session", "deny"):
+        if choice not in record["choices"]:
+            continue
+        label, color = labels[choice]
+        button = {
+            "action": {
+                "type": "callback",
+                "label": label,
+                "payload": json.dumps(
+                    {"t": "ha", "i": record["approval_id"], "c": choice},
+                    separators=(",", ":"),
+                ),
+            },
+            "color": color,
+        }
+        if choice == "deny" or len(buttons) >= 2:
+            buttons.append([button])
+        elif buttons and isinstance(buttons[-1], list) and len(buttons[-1]) < 2:
+            buttons[-1].append(button)
+        else:
+            buttons.append([button])
+    return {"one_time": False, "inline": True, "buttons": buttons}
+
+
+def handle_approval_request(
+    vk: dict[str, Any],
+    run_id: str,
+    event: dict[str, Any],
+    *,
+    trace_id: str | None = None,
+) -> dict[str, Any]:
+    requester_id = str(vk.get("from_id") or "")
+    request_peer = str(vk.get("peer_id") or requester_id)
+    if not requester_id or not request_peer:
+        raise RuntimeError("VK request origin could not be resolved for execution approval")
+    store = ApprovalStore(approval_db_path())
+    record = store.create(
+        run_id=run_id,
+        peer_id=request_peer,
+        requester_id=requester_id,
+        command=str(event.get("command") or "[команда не указана]"),
+        description=str(event.get("description") or "опасное действие"),
+        choices=list(event.get("choices") or ["once", "session", "deny"]),
+        ttl_seconds=max(30, min(240, int_env("VK_APPROVAL_TTL_SECONDS", 240))),
+    )
+    text = (
+        "⚠ Требуется подтверждение действия\n\n"
+        f"Команда:\n{record['command_preview']}\n\n"
+        f"Причина:\n{record['description']}\n\n"
+        "Разрешение «до конца запуска» действует только для текущего запуска Hermes.\n"
+        f"Код: {record['approval_code']}\n"
+        f"Запасной вариант: !run-allow {record['approval_code']} или !run-deny {record['approval_code']}\n"
+        "Срок действия: 4 минуты."
+    )
+    send_vk_message(
+        request_peer,
+        text,
+        random_id=stable_random_id(trace_id or run_id, int(record["ordinal"])),
+        keyboard=json.dumps(build_approval_keyboard(record), ensure_ascii=False),
+    )
+    return record
+
+
+def normalize_approval_decision(payload: dict[str, Any]) -> dict[str, str] | None:
+    if payload.get("type") == "message_event":
+        obj = payload.get("object") if isinstance(payload.get("object"), dict) else {}
+        raw = obj.get("payload")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(raw, dict) or raw.get("t") != "ha":
+            return None
+        return {
+            "approval_id": str(raw.get("i") or ""),
+            "choice": str(raw.get("c") or ""),
+            "peer_id": str(obj.get("peer_id") or ""),
+            "approver_id": str(obj.get("user_id") or ""),
+            "event_id": str(obj.get("event_id") or payload.get("event_id") or ""),
+        }
+    if payload.get("type") == "message_new":
+        vk = normalize_vk_message(payload)
+        match = re.fullmatch(r"!run-(allow|session|deny)\s+([A-Za-z0-9]{4,32})", vk["text"], re.IGNORECASE)
+        if not match:
+            return None
+        choice = {"allow": "once", "session": "session", "deny": "deny"}[match.group(1).lower()]
+        return {
+            "approval_code": match.group(2).upper(),
+            "choice": choice,
+            "peer_id": vk["peer_id"],
+            "approver_id": vk["from_id"],
+            "event_id": "",
+        }
+    return None
+
+
+def post_hermes_approval(run_id: str, choice: str) -> dict[str, Any]:
+    base = env("HERMES_API_BASE", "http://127.0.0.1:8642").rstrip("/")
+    key = env("HERMES_API_KEY") or env("API_SERVER_KEY")
+    if not key:
+        raise RuntimeError("HERMES_API_KEY/API_SERVER_KEY is required")
+    res = requests.post(
+        f"{base}/v1/runs/{run_id}/approval",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps({"choice": choice}).encode("utf-8"),
+        timeout=15,
+    )
+    if not res.ok:
+        if res.status_code in {404, 409}:
+            raise HermesApprovalNotPending(f"Hermes approval API HTTP {res.status_code}")
+        raise RuntimeError(f"Hermes approval API HTTP {res.status_code}: {res.text[:300]}")
+    data = res.json()
+    if int(data.get("resolved") or 0) < 1:
+        raise RuntimeError("Hermes approval API resolved no pending request")
+    return data
+
+
+def resolve_approval_payload(
+    payload: dict[str, Any],
+    store: ApprovalStore,
+    *,
+    post_choice=post_hermes_approval,
+) -> dict[str, Any]:
+    decision = normalize_approval_decision(payload)
+    if not decision:
+        raise ApprovalDecisionError("invalid_approval_command")
+    record = store.get(decision.get("approval_id", "")) if decision.get("approval_id") else store.get_by_code(decision.get("approval_code", ""))
+    if record is None:
+        raise ApprovalDecisionError("unknown_approval")
+    claimed = store.claim(
+        record["approval_id"],
+        approver_id=decision["approver_id"],
+        peer_id=decision["peer_id"],
+        choice=decision["choice"],
+    )
+    try:
+        post_choice(claimed["run_id"], decision["choice"])
+    except HermesApprovalNotPending:
+        store.finish(
+            claimed["approval_id"], status="stale", choice=decision["choice"], approver_id=decision["approver_id"]
+        )
+        result = store.get(claimed["approval_id"])
+        assert result is not None
+        return result
+    except Exception as exc:
+        LOG.error(
+            "approval result is uncertain after Hermes transport failure; refusing retry: %s",
+            redact_secrets(exc),
+        )
+        store.finish(
+            claimed["approval_id"], status="uncertain", choice=decision["choice"], approver_id=decision["approver_id"]
+        )
+        result = store.get(claimed["approval_id"])
+        assert result is not None
+        return result
+    status = "denied" if decision["choice"] == "deny" else "approved"
+    store.finish(
+        claimed["approval_id"], status=status, choice=decision["choice"], approver_id=decision["approver_id"]
+    )
+    result = store.get(claimed["approval_id"])
+    assert result is not None
+    return result
 
 
 class DedupStore:
@@ -2174,6 +2534,82 @@ def _store_poison_message(
     })
 
 
+def notify_approval_result(
+    payload: dict[str, Any],
+    result: dict[str, Any] | None,
+    error: str | None = None,
+) -> None:
+    decision = normalize_approval_decision(payload) or {}
+    if result and result.get("status") == "uncertain":
+        text = "⚠ Результат передачи решения неизвестен; повтор запрещён из соображений безопасности. Проверьте итог запуска."
+    elif result and result.get("status") == "stale":
+        text = "Запуск больше не ожидает это подтверждение; проверьте итог запуска."
+    elif error:
+        text = {
+            "unauthorized": "Подтверждать действия может только владелец.",
+            "peer_mismatch": "Запрос относится к другому диалогу.",
+            "expired": "Срок подтверждения истёк; действие не выполнено.",
+            "already_resolved": "Запрос уже обработан.",
+            "not_head": "Сначала обработайте предыдущий запрос этого запуска.",
+            "unknown_approval": "Запрос подтверждения не найден.",
+        }.get(error, "Не удалось обработать подтверждение.")
+    else:
+        choice = str((result or {}).get("choice") or "")
+        text = {
+            "once": "✅ Разрешено один раз",
+            "session": "✅ Разрешено до конца текущего запуска",
+            "deny": "❌ Действие отклонено",
+        }.get(choice, "Запрос обработан")
+    if payload.get("type") == "message_event" and decision.get("event_id"):
+        _vk_method(
+            "messages.sendMessageEventAnswer",
+            {
+                "event_id": decision["event_id"],
+                "user_id": decision["approver_id"],
+                "peer_id": decision["peer_id"],
+                "event_data": json.dumps({"type": "show_snackbar", "text": text}, ensure_ascii=False),
+            },
+        )
+    elif decision.get("peer_id"):
+        reply_vk(decision["peer_id"], text, trace_id=f"approval-{decision.get('approval_code', '')}")
+
+
+def run_approval_once(
+    client: Any,
+    queue_url: str,
+    store: ApprovalStore,
+    *,
+    post_choice=post_hermes_approval,
+    notify_func=notify_approval_result,
+) -> int:
+    res = client.receive_message(
+        QueueUrl=queue_url,
+        MaxNumberOfMessages=1,
+        WaitTimeSeconds=int_env("QUEUE_WAIT_TIME_SECONDS", 20),
+        VisibilityTimeout=30,
+    )
+    messages = res.get("Messages") or []
+    for msg in messages:
+        receipt = msg["ReceiptHandle"]
+        try:
+            body = json.loads(msg.get("Body") or "{}")
+            payload = body.get("payload") if isinstance(body, dict) and "payload" in body else body
+            if not isinstance(payload, dict):
+                raise ApprovalDecisionError("invalid_approval_command")
+            result = resolve_approval_payload(payload, store, post_choice=post_choice)
+            notify_func(payload, result)
+        except ApprovalDecisionError as exc:
+            error = str(exc)
+            LOG.warning("approval rejected reason=%s", error)
+            if isinstance(locals().get("payload"), dict):
+                notify_func(payload, None, error=error)
+        except Exception as exc:
+            LOG.exception("approval processing failed; leaving message for retry: %s", redact_secrets(exc))
+            continue
+        client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+    return len(messages)
+
+
 def run_once(
     client: Any,
     queue_url: str,
@@ -2225,6 +2661,7 @@ def main() -> int:
     default_review = str(default_state / "vk-worker-review.sqlite3")
     default_poison = str(default_state / "vk-worker-poison.sqlite3")
     default_rate = str(default_state / "vk-worker-rate-limit.sqlite3")
+    default_approval = str(default_state / "vk-worker-approvals.sqlite3")
     default_fixture_dir = str(Path(__file__).resolve().parents[1] / "fixtures" / "vk")
 
     parser = argparse.ArgumentParser()
@@ -2232,11 +2669,13 @@ def main() -> int:
     parser.add_argument("--hermes-env", default="/root/.hermes/.env", help="Hermes .env path for API_SERVER_KEY fallback")
     parser.add_argument("--once", action="store_true", help="process one poll cycle and exit")
     parser.add_argument("--long-poll", action="store_true", help="use VK Long Poll directly instead of Yandex Message Queue")
+    parser.add_argument("--approval-worker", action="store_true", help="consume the independent execution-approval queue")
     parser.add_argument("--dedup-db", help="SQLite dedup store path")
     parser.add_argument("--trace-db", help="SQLite trace store path")
     parser.add_argument("--review-db", help="SQLite review inbox path")
     parser.add_argument("--poison-db", help="SQLite poison-message/dead-letter path")
     parser.add_argument("--rate-db", help="SQLite public rate-limit path")
+    parser.add_argument("--approval-db", help="SQLite execution-approval store path")
     parser.add_argument("--fake-event", help="process a saved VK event fixture without VK/Yandex/Hermes secrets")
     parser.add_argument("--replay", nargs="+", help="replay one or more saved VK event fixtures with fake Hermes/VK sends")
     parser.add_argument("--fake-hermes-answer", default="Fake Hermes response.", help="assistant text used by --fake-event/--replay")
@@ -2305,6 +2744,20 @@ def main() -> int:
         )
         print(format_smoke_report(report))
         return 0 if report["ok"] else 2
+
+    if args.approval_worker:
+        queue_url = env("APPROVAL_QUEUE_URL")
+        if not queue_url:
+            raise SystemExit("APPROVAL_QUEUE_URL is required")
+        approval_store = ApprovalStore(args.approval_db or env("APPROVAL_DB", default_approval))
+        recovered = approval_store.recover_interrupted()
+        if recovered:
+            LOG.error("marked %s interrupted approval resolution(s) uncertain", recovered)
+        client = sqs_client()
+        while True:
+            run_approval_once(client, queue_url, approval_store)
+            if args.once:
+                return 0
 
     if args.long_poll:
         return run_long_poll_loop(

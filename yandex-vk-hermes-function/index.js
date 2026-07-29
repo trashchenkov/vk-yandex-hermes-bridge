@@ -305,13 +305,49 @@ function getSqsClient() {
 
 function queueDedupId(payload) {
   const vk = normalizeVkMessage(payload);
+  if (payload.type === 'message_event') {
+    const object = payload.object && typeof payload.object === 'object' ? payload.object : {};
+    let action = object.payload;
+    if (typeof action === 'string') {
+      try { action = JSON.parse(action); } catch (_err) { /* keep the original string */ }
+    }
+    const raw = [
+      payload.group_id || '', object.event_id || payload.event_id || '',
+      object.peer_id || '', object.user_id || '', JSON.stringify(action || ''),
+    ].join('|');
+    return crypto.createHash('sha256').update(raw).digest('hex');
+  }
   const raw = [payload.event_id || '', payload.group_id || '', vk.peerId, vk.messageId, vk.text].join('|');
   return crypto.createHash('sha256').update(raw).digest('hex');
 }
 
+function isApprovalPayload(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (payload.type === 'message_event') {
+    const object = payload.object && typeof payload.object === 'object' ? payload.object : {};
+    let action = object.payload;
+    if (typeof action === 'string') {
+      try { action = JSON.parse(action); } catch (_err) { return false; }
+    }
+    return Boolean(action && action.t === 'ha' && action.i && action.c);
+  }
+  if (payload.type === 'message_new') {
+    return /^!run-(?:allow|session|deny)\s+[A-Za-z0-9]{4,32}$/i.test(normalizeVkMessage(payload).text);
+  }
+  return false;
+}
+
+function queueUrlForPayload(payload) {
+  if (isApprovalPayload(payload)) return env('APPROVAL_QUEUE_URL');
+  return env('QUEUE_URL');
+}
+
 async function enqueueMessage(payload) {
-  const queueUrl = env('QUEUE_URL');
-  if (!queueUrl) throw new Error('QUEUE_URL is required in BRIDGE_MODE=queue');
+  const queueUrl = queueUrlForPayload(payload);
+  if (!queueUrl) {
+    const name = isApprovalPayload(payload) ? 'APPROVAL_QUEUE_URL' : 'QUEUE_URL';
+    throw new Error(`${name} is required in BRIDGE_MODE=queue`);
+  }
 
   const body = JSON.stringify({ payload, received_at: new Date().toISOString() });
   const input = {
@@ -371,7 +407,7 @@ exports.handler = async function handler(event, _context) {
     return response(200, env('VK_CONFIRMATION_TOKEN'));
   }
 
-  if (payload.type === 'message_new') {
+  if (payload.type === 'message_new' || isApprovalPayload(payload)) {
     const mode = env('BRIDGE_MODE', 'queue');
     if (mode === 'queue') {
       try {
@@ -396,3 +432,5 @@ exports.handler = async function handler(event, _context) {
   // VK requires literal "ok" for regular events.
   return response(200, 'ok');
 };
+
+exports._test = { isApprovalPayload, queueUrlForPayload, queueDedupId };

@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT="${OUT:-/tmp/vk-hermes-function.zip}"
 FUNCTION_NAME="${FUNCTION_NAME:-vk-hermes-callback}"
 SERVICE_ACCOUNT_ID="${SERVICE_ACCOUNT_ID:-}"
-RUNTIME="${RUNTIME:-nodejs20}"
+RUNTIME="${RUNTIME:-nodejs22}"
 ENTRYPOINT="${ENTRYPOINT:-index.handler}"
 MEMORY="${MEMORY:-128m}"
 EXECUTION_TIMEOUT="${EXECUTION_TIMEOUT:-30s}"
@@ -27,7 +27,7 @@ Safe defaults:
 Required for real deploy:
   yc CLI authenticated and configured
   SERVICE_ACCOUNT_ID
-  QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+  QUEUE_URL, APPROVAL_QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
   QUEUE_ENDPOINT, VK_GROUP_ID, VK_CONFIRMATION_TOKEN, VK_SECRET
 EOF
 }
@@ -59,6 +59,7 @@ fi
 
 required_env=(
   QUEUE_URL
+  APPROVAL_QUEUE_URL
   AWS_ACCESS_KEY_ID
   AWS_SECRET_ACCESS_KEY
   AWS_REGION
@@ -98,7 +99,7 @@ VK_CALLBACK_URL="${VK_CALLBACK_URL:-https://functions.yandexcloud.net/${FUNCTION
 
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "DRY RUN: would create Yandex Cloud Function version"
-  echo "yc serverless function version create --function-name $FUNCTION_NAME --runtime $RUNTIME --entrypoint $ENTRYPOINT --memory $MEMORY --execution-timeout $EXECUTION_TIMEOUT --source-path $OUT --service-account-id ${SERVICE_ACCOUNT_ID:-<SERVICE_ACCOUNT_ID>} --environment BRIDGE_MODE=queue,QUEUE_URL=***,AWS_ACCESS_KEY_ID=***,AWS_SECRET_ACCESS_KEY=***,AWS_REGION=***,QUEUE_ENDPOINT=***,VK_GROUP_ID=***,VK_CONFIRMATION_TOKEN=***,VK_SECRET=***"
+  echo "yc serverless function version create --function-name $FUNCTION_NAME --runtime $RUNTIME --entrypoint $ENTRYPOINT --memory $MEMORY --execution-timeout $EXECUTION_TIMEOUT --source-path $OUT --service-account-id ${SERVICE_ACCOUNT_ID:-<SERVICE_ACCOUNT_ID>} --environment BRIDGE_MODE=queue,QUEUE_URL=***,APPROVAL_QUEUE_URL=***,AWS_ACCESS_KEY_ID=***,AWS_SECRET_ACCESS_KEY=***,AWS_REGION=***,QUEUE_ENDPOINT=***,VK_GROUP_ID=***,VK_CONFIRMATION_TOKEN=***,VK_SECRET=***"
   echo "VK Callback URL: $VK_CALLBACK_URL"
   exit 0
 fi
@@ -108,6 +109,10 @@ if ! command -v yc >/dev/null 2>&1; then
   exit 2
 fi
 
+result_file="$(mktemp)"
+chmod 600 "$result_file"
+trap 'rm -f "$result_file"' EXIT
+
 yc serverless function version create \
   --function-name "$FUNCTION_NAME" \
   --runtime "$RUNTIME" \
@@ -116,6 +121,9 @@ yc serverless function version create \
   --execution-timeout "$EXECUTION_TIMEOUT" \
   --source-path "$OUT" \
   --service-account-id "$SERVICE_ACCOUNT_ID" \
-  --environment "$env_arg"
+  --environment "$env_arg" \
+  --format json >"$result_file"
 
+version_id="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["id"])' "$result_file")"
+echo "Created function version: $version_id"
 echo "VK Callback URL: $VK_CALLBACK_URL"

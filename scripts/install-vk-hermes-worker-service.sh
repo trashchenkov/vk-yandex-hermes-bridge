@@ -7,6 +7,7 @@ PY="${PYTHON_BIN:-python3}"
 VENV="$ROOT/.venv"
 ENV_FILE="$ROOT/.env"
 SERVICE=/etc/systemd/system/vk-hermes-worker.service
+APPROVAL_SERVICE=/etc/systemd/system/vk-hermes-approval-worker.service
 
 install -m 700 -d "$ROOT/state"
 "$PY" -m venv "$VENV"
@@ -19,6 +20,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
   cat > "$ENV_FILE" <<'EOF'
 # Fill these after creating Yandex Message Queue + SA static key.
 QUEUE_URL=
+APPROVAL_QUEUE_URL=
 AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 AWS_REGION=ru-central1
@@ -61,8 +63,28 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable vk-hermes-worker.service
+cat > "$APPROVAL_SERVICE" <<EOF
+[Unit]
+Description=VK Hermes execution approval worker
+After=network-online.target hermes-gateway.service vk-hermes-worker.service
+Wants=network-online.target
+Requires=hermes-gateway.service
 
-echo "Installed vk-hermes-worker.service"
-echo "Edit $ENV_FILE, then run: systemctl restart vk-hermes-worker.service"
+[Service]
+Type=simple
+WorkingDirectory=$ROOT
+EnvironmentFile=$ENV_FILE
+ExecStart=$VENV/bin/python $ROOT/vm-worker/vk_hermes_worker.py --approval-worker --env $ENV_FILE --hermes-env /root/.hermes/.env
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable vk-hermes-worker.service vk-hermes-approval-worker.service
+
+echo "Installed vk-hermes-worker.service and vk-hermes-approval-worker.service"
+echo "Edit $ENV_FILE, then run: systemctl restart vk-hermes-worker.service vk-hermes-approval-worker.service"
