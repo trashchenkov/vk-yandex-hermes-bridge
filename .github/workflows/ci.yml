@@ -64,4 +64,6 @@ jobs:
           bash -n scripts/deploy-yandex-function.sh
 
       - name: Check Docker Compose config
-        run: docker compose config >/dev/null
+        run: |
+          cp .env.example .env
+          docker compose config >/dev/null

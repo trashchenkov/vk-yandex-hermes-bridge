@@ -28,7 +28,9 @@ import requests
 from botocore.config import Config
 
 LOG = logging.getLogger("vk_hermes_worker")
-VK_MAX_MESSAGE_CHARS = 9000
+# Conservative operational cap after VK messages.send rejected a 9000-character
+# response with error 914. The lower cap also leaves room for chunk numbering.
+VK_MAX_MESSAGE_CHARS = 4000
 
 
 def redact_secrets(value: Any) -> str:
