@@ -43,7 +43,8 @@ const VK_API_VERSION = env('VK_API_VERSION', '5.199');
 const HERMES_MODEL = env('HERMES_MODEL', 'hermes-agent');
 const HERMES_TIMEOUT_MS = intEnv('HERMES_TIMEOUT_MS', 120000);
 const BRIDGE_ENQUEUE_TIMEOUT_MS = intEnv('BRIDGE_ENQUEUE_TIMEOUT_MS', 1500);
-const VK_MAX_MESSAGE_CHARS = 9000;
+// Conservative operational cap after VK messages.send rejected a 9000-character response.
+const VK_MAX_MESSAGE_CHARS = 4000;
 
 let sqsClient = null;
 
@@ -230,6 +231,14 @@ async function callHermes(vk) {
   return answer;
 }
 
+function codePointSafeBoundary(value, index) {
+  if (index <= 0 || index >= value.length) return index;
+  const before = value.charCodeAt(index - 1);
+  const after = value.charCodeAt(index);
+  const splitsSurrogatePair = before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF;
+  return splitsSurrogatePair ? index - 1 : index;
+}
+
 function splitForVk(text) {
   const prefix = env('VK_REPLY_PREFIX', '');
   let remaining = `${prefix}${text || ''}`.trim() || 'Готово.';
@@ -239,6 +248,7 @@ function splitForVk(text) {
     if (cut < VK_MAX_MESSAGE_CHARS / 2) cut = remaining.lastIndexOf('\n', VK_MAX_MESSAGE_CHARS);
     if (cut < VK_MAX_MESSAGE_CHARS / 2) cut = remaining.lastIndexOf(' ', VK_MAX_MESSAGE_CHARS);
     if (cut <= 0) cut = VK_MAX_MESSAGE_CHARS;
+    cut = codePointSafeBoundary(remaining, cut);
     chunks.push(remaining.slice(0, cut).trim());
     remaining = remaining.slice(cut).trim();
   }
@@ -396,3 +406,5 @@ exports.handler = async function handler(event, _context) {
   // VK requires literal "ok" for regular events.
   return response(200, 'ok');
 };
+
+exports._test = { splitForVk };
